@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+Main entry point for the Trading Bot application.
+Handles configuration loading, logging setup, and bot initialization.
+"""
+
+import json
+import os
+import sys
+import logging
+import logging.handlers
+import argparse
+import signal
+from datetime import datetime
+import pytz
+import traceback
+import time
+
+
+def load_config(config_path):
+    """
+    Load the configuration file and substitute environment variables.
+
+    Args:
+        config_path (str): Path to the config file
+
+    Returns:
+        dict: Processed configuration dictionary
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        json.JSONDecodeError: If config file contains invalid JSON
+        ValueError: If configuration is invalid after substitution
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        # Recursively substitute environment variables
+        config = substitute_env_vars(config)
+        
+        # Check for any ENV_NOT_FOUND placeholders
+        env_check_result = check_for_missing_env_vars(config)
+        if env_check_result:
+            missing_vars = ', '.join(env_check_result)
+            logging.warning(f"Missing environment variables detected: {missing_vars}")
+            
+        return config
+    except FileNotFoundError:
+        logging.critical(f"Config file not found: {config_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logging.critical(f"Invalid JSON in config file: {str(e)}")
+        raise
+
+
+def substitute_env_vars(item):
+    """
+    Recursively substitute environment variables in a configuration item.
+
+    Args:
+        item: Configuration item (dict, list, or scalar)
+
+    Returns:
+        The item with environment variables substituted
+    """
+    if isinstance(item, dict):
+        return {k: substitute_env_vars(v) for k, v in item.items()}
+    elif isinstance(item, list):
+        return [substitute_env_vars(i) for i in item]
+    elif isinstance(item, str) and item.startswith("ENV:"):
+        env_var = item[4:]
+        env_value = os.environ.get(env_var)
+        if env_value is None:
+            logging.warning(f"Environment variable {env_var} not found")
+            return f"ENV_NOT_FOUND_{env_var}"
+        
+        # Try to convert to appropriate type if it appears to be a number
+        if env_value.isdigit():
+            return int(env_value)
+        try:
+            float_val = float(env_value)
+            return float_val
+        except ValueError:
+            pass
+            
+        # Handle boolean values
+        if env_value.lower() in ('true', 'yes', '1'):
+            return True
+        if env_value.lower() in ('false', 'no', '0'):
+            return False
+            
+        return env_value
+    return item
+
+
+def check_for_missing_env_vars(config):
+    """
+    Check for missing environment variables in the configuration.
+    
+    Args:
+        config: Configuration dict with substituted values
+        
+    Returns:
+        list: List of missing environment variable names
+    """
+    missing_vars = []
+    
+    def check_item(item):
+        if isinstance(item, dict):
+            for k, v in item.items():
+                check_item(v)
+        elif isinstance(item, list):
+            for i in item:
+                check_item(i)
+        elif isinstance(item, str) and item.startswith("ENV_NOT_FOUND_"):
+            missing_vars.append(item[14:])  # Extract env var name
+    
+    check_item(config)
+    return missing_vars
+
+
+def setup_logging(config):
+    """
+    Set up logging based on configuration.
+
+    Args:
+        config (dict): Logging configuration
+    """
+    try:
+        # Extract logging configuration
+        log_level_name = config.get('log_level', 'INFO').upper()
+        log_file = config.get('log_file', 'logs/trading_bot.log')
+        max_log_size = config.get('max_log_size', 10 * 1024 * 1024)  # 10 MB
+        backup_count = config.get('backup_count', 5)
+        log_format = config.get('log_format',
+                                '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+        # Create logs directory if it doesn't exist
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        # Get log level
+        log_level = getattr(logging, log_level_name, logging.INFO)
+
+        # Configure root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+
+        # Clear any existing handlers
+        root_logger.handlers = []
+
+        # Create formatter
+        formatter = logging.Formatter(log_format)
+
+        # Create console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+        # Create file handler with rotation
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=max_log_size, backupCount=backup_count, encoding='utf-8'
+        )
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+        logging.info(f"Logging configured with level {log_level_name}, file: {log_file}")
+    except Exception as e:
+        logging.critical(f"Error setting up logging: {str(e)}")
+        raise
+
+
+def parse_arguments():
+    """
+    Parse command line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed arguments
+    """
+    try:
+        parser = argparse.ArgumentParser(description="Trading Bot Application")
+        parser.add_argument(
+            "-c", "--config",
+            default="config.json",
+            help="Path to configuration file (default: config.json)"
+        )
+        parser.add_argument(
+            "-m", "--mode",
+            choices=["live", "backtest"],
+            help="Override trading mode from config"
+        )
+        parser.add_argument(
+            "-v", "--verbose",
+            action="store_true",
+            help="Enable verbose logging"
+        )
+        return parser.parse_args()
+    except Exception as e:
+        logging.error(f"Error parsing arguments: {str(e)}")
+        sys.exit(1)
+
+
+def handle_signals(bot):
+    """
+    Set up signal handlers for graceful shutdown.
+
+    Args:
+        bot: The trading bot instance
+    """
+    def signal_handler(sig, frame):
+        logging.info(f"Received signal {sig}, shutting down...")
+        try:
+            if bot:
+                bot.stop()
+            else:
+                logging.warning("Bot instance not available, cannot call stop()")
+            sys.exit(0)
+        except Exception as e:
+            logging.error(f"Error during shutdown: {str(e)}")
+            sys.exit(1)
+
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        logging.debug("Signal handlers registered")
+    except Exception as e:
+        logging.error(f"Error setting up signal handlers: {str(e)}")
+
+
+def validate_config(config):
+    """
+    Validate essential configuration parameters.
+
+    Args:
+        config (dict): Configuration dictionary
+
+    Returns:
+        bool: True if configuration is valid
+
+    Raises:
+        ValueError: If essential configuration is missing
+    """
+    try:
+        # Check required top-level sections
+        required_sections = ['central_trading_bot', 'symbols', 'risk_management', 
+                             'signal_generation', 'trade_execution', 'data_ingestion']
+        for section in required_sections:
+            if section not in config:
+                raise ValueError(f"Missing required configuration section: {section}")
+
+        # Validate trading mode
+        mode = config['central_trading_bot'].get('mode')
+        if mode not in ['live', 'backtest']:
+            raise ValueError(f"Invalid trading mode: {mode}. Must be 'live' or 'backtest'")
+
+        # Validate symbols
+        if not config['symbols'] or not isinstance(config['symbols'], list):
+            raise ValueError("No trading symbols specified in configuration")
+            
+        # Check symbol settings
+        if 'symbol_settings' not in config:
+            logging.warning("Missing symbol_settings section in configuration")
+        else:
+            for symbol in config['symbols']:
+                if symbol not in config['symbol_settings']:
+                    logging.warning(f"Missing settings for symbol: {symbol}")
+                else:
+                    # Validate required symbol settings
+                    symbol_settings = config['symbol_settings'][symbol]
+                    required_symbol_settings = ['point', 'pip_value_per_lot', 'min_volume', 'max_spread_pips']
+                    for setting in required_symbol_settings:
+                        if setting not in symbol_settings:
+                            logging.warning(f"Missing setting '{setting}' for symbol {symbol}")
+
+        # Validate MT5 settings for live mode
+        if mode == 'live':
+            if 'mt5_settings' not in config:
+                raise ValueError("Missing MT5 settings for live trading")
+            required_mt5 = ['server', 'login', 'password']
+            for setting in required_mt5:
+                if setting not in config['mt5_settings'] or not config['mt5_settings'][setting]:
+                    raise ValueError(f"Missing or empty required MT5 setting: {setting}")
+
+        # Validate signal generation settings
+        sig_gen = config.get('signal_generation', {})
+        required_sig_gen = ['timeframes', 'trading_timeframes', 'thresholds']
+        for setting in required_sig_gen:
+            if setting not in sig_gen:
+                logging.warning(f"Missing '{setting}' in signal_generation configuration")
+                
+        # Validate risk management settings
+        risk_mgmt = config.get('risk_management', {})
+        required_risk = ['max_drawdown', 'risk_per_trade', 'max_daily_loss', 'max_trades_per_day']
+        for setting in required_risk:
+            if setting not in risk_mgmt:
+                logging.warning(f"Missing '{setting}' in risk_management configuration")
+                
+        # Validate trade execution settings
+        trade_exec = config.get('trade_execution', {})
+        required_trade = ['max_slippage_pips', 'max_spread_multiplier']
+        for setting in required_trade:
+            if setting not in trade_exec:
+                logging.warning(f"Missing '{setting}' in trade_execution configuration")
+
+        logging.debug("Configuration validated successfully")
+        return True
+    except ValueError as e:
+        logging.critical(f"Configuration error: {str(e)}")
+        raise
+    except Exception as e:
+        logging.critical(f"Unexpected error validating config: {str(e)}")
+        raise
+
+
+def main():
+    """
+    Main entry point for the application.
+    """
+    # Init basic logging for startup
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Parse command line arguments
+    args = parse_arguments()
+    bot = None
+
+    try:
+        # Load configuration
+        logging.info(f"Loading configuration from {args.config}")
+        config = load_config(args.config)
+
+        # Override mode if specified
+        if args.mode:
+            logging.info(f"Overriding trading mode to {args.mode}")
+            config['central_trading_bot']['mode'] = args.mode
+            # Update any other mode-dependent settings
+            if args.mode == 'live':
+                config['modules_enabled'] = config.get('live_modules_enabled', config.get('modules_enabled', {}))
+            else:  # backtest
+                config['modules_enabled'] = config.get('backtest_modules_enabled', config.get('modules_enabled', {}))
+
+        # Set verbose logging if requested
+        if args.verbose:
+            config.setdefault('trade_logger', {})['log_level'] = 'DEBUG'
+
+        # Validate configuration
+        validate_config(config)
+
+        # Set up proper logging
+        trade_logger_config = config.get('trade_logger', {})
+        setup_logging(trade_logger_config)
+
+        # Import and create trading bot instance
+        try:
+            from CentralTradingBot import CentralTradingBot
+            bot = CentralTradingBot(config)
+            logging.info("Trading bot instance created successfully")
+        except ImportError as e:
+            logging.critical(f"Failed to import CentralTradingBot: {str(e)}")
+            return 1
+        except Exception as e:
+            logging.critical(f"Failed to initialize trading bot: {str(e)}")
+            logging.debug(traceback.format_exc())
+            return 1
+
+        # Set up signal handlers
+        handle_signals(bot)
+
+        # Load previous state if available
+        try:
+            state_loaded = bot.load_state()
+            if state_loaded:
+                logging.info("Previous state loaded successfully")
+            else:
+                logging.info("No previous state found or state loading skipped")
+        except Exception as e:
+            logging.error(f"Error loading previous state: {str(e)}")
+            # Continue execution even if state loading fails
+
+        # Start the bot based on mode
+        mode = config['central_trading_bot']['mode']
+        logging.info(f"Starting bot in {mode} trading mode")
+        
+        start_success = False
+        try:
+            start_success = bot.start()
+            if not start_success:
+                logging.error("Bot failed to start properly")
+                return 1
+        except Exception as e:
+            logging.critical(f"Error starting trading bot: {str(e)}")
+            logging.debug(traceback.format_exc())
+            return 1
+
+        # Keep main thread alive for live mode
+        try:
+            while bot.state == 'running':
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logging.info("Received keyboard interrupt, shutting down...")
+            print("\nShutting down gracefully...")
+            if bot:
+                bot.stop()
+
+        # Generate summary report
+        try:
+            if bot and bot.state in ['stopped', 'completed']:
+                report = bot.generate_report()
+                if report:
+                    logging.info("Generated performance report")
+                    timestamp = datetime.now(pytz.UTC).strftime('%Y%m%d_%H%M%S')
+                    report_dir = 'reports'
+                    
+                    # Ensure report directory exists
+                    try:
+                        os.makedirs(report_dir, exist_ok=True)
+                    except Exception as e:
+                        logging.error(f"Failed to create reports directory: {str(e)}")
+                        # Fall back to current directory
+                        report_dir = '.'
+                        
+                    report_file = os.path.join(report_dir, f"report_{timestamp}.json")
+                    with open(report_file, 'w', encoding='utf-8') as f:
+                        json.dump(report, f, indent=2)
+                    logging.info(f"Report saved to {report_file}")
+                else:
+                    logging.info("No report data available")
+            else:
+                logging.warning("Bot not in proper state for report generation")
+        except Exception as e:
+            logging.error(f"Error generating report: {str(e)}")
+
+        logging.info("Trading bot has completed execution")
+        return 0  # Success
+
+    except FileNotFoundError:
+        logging.critical(f"Configuration file not found: {args.config}")
+        print(f"ERROR: Configuration file not found: {args.config}")
+        print("Please specify a valid configuration file with --config")
+        return 1
+
+    except json.JSONDecodeError as e:
+        logging.critical(f"Invalid JSON in configuration file: {str(e)}")
+        print(f"ERROR: Invalid JSON in configuration file: {str(e)}")
+        return 1
+
+    except ValueError as e:
+        logging.critical(f"Configuration error: {str(e)}")
+        print(f"ERROR: Configuration error: {str(e)}")
+        return 1
+
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt, shutting down...")
+        print("\nShutting down gracefully...")
+        if bot:
+            try:
+                bot.stop()
+            except Exception as e:
+                logging.error(f"Error during shutdown: {str(e)}")
+        return 0
+
+    except Exception as e:
+        logging.critical(f"Unhandled exception: {str(e)}")
+        logging.debug(traceback.format_exc())
+        print(f"ERROR: An unexpected error occurred: {str(e)}")
+        
+        # Try to shutdown the bot if it exists
+        if bot:
+            try:
+                bot.stop()
+            except Exception as shutdown_error:
+                logging.error(f"Error shutting down bot: {str(shutdown_error)}")
+                
+        return 1
+    finally:
+        # Ensure bot is stopped if it exists and is still running
+        if bot and hasattr(bot, 'state') and bot.state == 'running':
+            try:
+                logging.info("Ensuring bot is stopped in finally block")
+                bot.stop()
+            except Exception as e:
+                logging.error(f"Error in final shutdown: {str(e)}")
+
+
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)
