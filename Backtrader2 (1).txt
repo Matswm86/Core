@@ -1,0 +1,560 @@
+import backtrader as bt
+import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
+import traceback
+from typing import Dict, Optional, Any, List # Added List, Optional, Any
+
+# It no longer needs direct references to MS/OF if SG handles the calls
+# from SignalGenerator import SignalGenerator # Passed in params
+
+class BacktraderStrategy(bt.Strategy):
+    """
+    Simplified Backtrader strategy adapter (Refactored).
+    Delegates analysis, signal validation, and risk management (including position sizing, SL/TP)
+    to the SignalGenerator instance passed in parameters.
+    Focuses on executing validated signals received from SignalGenerator via the Backtrader engine
+    and handling Backtrader-specific notifications and cooldowns.
+    """
+    params = (
+        # --- Essential Parameters ---
+        ('signal_generator', None),  # MUST pass the initialized SignalGenerator instance
+
+        # --- Cooldown/Limit Parameters (Can remain here or move fully to RM) ---
+        ('max_trades_per_day', 5), # Simple daily limit check here
+        ('market_open_cooldown_minutes', 15),
+        ('trade_cooldown_minutes', 45),
+        ('loss_cooldown_multiplier', 2.0)
+        # --- All other analysis/risk parameters are removed ---
+    )
+
+    def __init__(self):
+        """Initialize strategy with simplified tracking variables."""
+        self.logger = logging.getLogger(__name__)
+        if not self.p.signal_generator:
+            self.logger.error("CRITICAL: SignalGenerator instance not passed to BacktraderStrategy params!")
+            raise ValueError("SignalGenerator instance is required.")
+        # Make signal generator easily accessible
+        self.signal_generator = self.p.signal_generator
+
+        # Simplified order/position tracking
+        self.order = None # Tracks the pending *entry* order
+        # Stores refs of SL/TP orders linked to an entry order ref
+        # Key: entry_order.ref, Value: {'sl': sl_order.ref, 'tp': tp_order.ref}
+        self.linked_orders = {}
+        # Tracks active positions {symbol: entry_order_ref} - stores the ref of the entry order
+        self.active_positions = {}
+
+        # Tracking for cooldowns and daily limits
+        self.daily_trades = {} # {date: count}
+        self.last_trade_time = {} # {symbol: datetime}
+        self.last_loss_time = {} # {symbol: datetime}
+        self.last_day = None
+
+        self.logger.info("Simplified BacktraderStrategy initialized")
+
+    # --- Methods Removed (Logic moved to SG/RM/MS/OF) ---
+    # _calculate_indicators - No longer needed here
+    # _calculate_position_size - Done by Risk Management via evaluate_signal
+    # _validate_signal_quality - Done by Signal Generator / Risk Management
+
+    # --- Data Preparation (Placeholder - Needs Review/Optimization/Removal) ---
+    def _prepare_dataframe(self, data, lookback=250) -> Optional[pd.DataFrame]:
+        """
+        Convert backtrader data lines to pandas DataFrame for analysis modules.
+        NOTE: Potential bottleneck. Consider adapting analysis modules to use data lines
+              or implement more efficient DataFrame caching/updates if required by analysis modules.
+              This version only includes OHLCV + timestamp. ALL indicators must be calculated
+              by the analysis modules (MS/OF) themselves.
+        """
+        symbol = self._get_symbol_from_data(data)
+        try:
+            actual_lookback = min(lookback, len(data))
+            if actual_lookback < 20: # Need some minimal length for context
+                 self.log(f"Insufficient data length ({actual_lookback}) for DataFrame prep", level=logging.WARNING, symbol=symbol)
+                 return None
+
+            # Efficiently get data slices using get() method
+            dates = [data.datetime.datetime(-i) for i in range(actual_lookback)][::-1]
+            o = data.open.get(size=actual_lookback)
+            h = data.high.get(size=actual_lookback)
+            l = data.low.get(size=actual_lookback)
+            c = data.close.get(size=actual_lookback)
+            v = data.volume.get(size=actual_lookback)
+
+            # Create DataFrame
+            df = pd.DataFrame({
+                'open': o, 'high': h, 'low': l, 'close': c, 'volume': v
+            }, index=pd.to_datetime(dates, utc=True)) # Ensure index is datetime and UTC
+
+            df['symbol'] = symbol
+            df.columns = [col.lower() for col in df.columns] # Standardize column names
+
+            # Add datetime column needed by some analysis functions
+            df['datetime'] = df.index
+
+            # VERY IMPORTANT: Analysis modules MUST handle all indicator calculations (ATR, MA, VWAP etc.)
+            # based on this raw OHLCV DataFrame.
+
+            return df
+
+        except IndexError:
+             self.log(f"IndexError preparing DataFrame for {symbol}, likely insufficient data ({len(data)} bars)", level=logging.WARNING, symbol=symbol)
+             return None
+        except Exception as e:
+            self.log(f"Error preparing DataFrame for {symbol}: {str(e)}", level=logging.ERROR, symbol=symbol)
+            self.logger.debug(traceback.format_exc())
+            return None
+
+    def _simulate_real_time_data(self, data) -> Optional[Dict[str, Any]]:
+        """
+        Create minimal simulated real-time data needed for analysis modules.
+        NOTE: Highly simplistic simulation, especially for delta/imbalance.
+              May limit the accuracy of OrderFlow backtesting.
+        """
+        symbol = self._get_symbol_from_data(data)
+        try:
+            if len(data) < 2: return None
+
+            # Basic fields from the current bar
+            sim_rtd = {
+                'last_price': data.close[0],
+                'bid': data.close[0] - (data.open[0] * 0.00005), # Tiny simulated spread
+                'ask': data.close[0] + (data.open[0] * 0.00005),
+                'last_volume': data.volume[0] if data.volume[0] > 0 else 1, # Avoid zero volume
+                'timestamp': data.datetime.datetime(0).isoformat(),
+                'symbol': symbol
+            }
+
+            # --- Basic Delta History Simulation ---
+            delta_history_len = 50 # Configurable?
+            delta_hist = deque(maxlen=delta_history_len)
+            lookback = min(delta_history_len, len(data) - 1)
+            for i in range(lookback):
+                price_change = data.close[-i] - data.close[-i - 1]
+                volume = data.volume[-i] if data.volume[-i] > 0 else 1
+                delta = volume if price_change > 0 else -volume if price_change < 0 else 0
+                # Alternative: Assume fraction of volume based on close position in range? More complex.
+                delta_hist.appendleft(delta)
+
+            sim_rtd['delta_history'] = delta_hist
+            sim_rtd['cumulative_delta'] = sum(delta_hist)
+            sim_rtd['bid_ask_imbalance'] = 0.0 # Cannot simulate accurately
+
+            return sim_rtd
+        except Exception as e:
+            self.log(f"Error simulating real-time data for {symbol}: {e}", level=logging.ERROR, symbol=symbol)
+            return None
+
+    # --- Notification Handlers (Refined) ---
+    def notify_order(self, order):
+        """Handles order updates from Backtrader."""
+        symbol = self._get_symbol_from_data(order.data) if order.data else "Unknown"
+        order_ref = order.ref
+
+        if order.status == order.Accepted:
+            if self.order and order_ref == self.order.ref:
+                self.log(f"ENTRY order {order_ref} Accepted", symbol=symbol)
+            elif order_ref in [ref for sltp in self.linked_orders.values() for ref in sltp.values()]:
+                 # Optional: Log acceptance of SL/TP orders
+                 # self.log(f"SL/TP order {order_ref} Accepted", symbol=symbol)
+                 pass
+            return
+
+        if order.status == order.Completed:
+            entry_ref_completed = None
+            is_exit_order = False
+            exit_type = None
+
+            # Check if it's an SL/TP order that closed a position
+            for entry_ref, sltp_refs in list(self.linked_orders.items()): # Iterate copy
+                if order_ref == sltp_refs.get('sl'):
+                    entry_ref_completed = entry_ref
+                    is_exit_order = True
+                    exit_type = 'SL'
+                    other_ref = sltp_refs.get('tp')
+                    break
+                elif order_ref == sltp_refs.get('tp'):
+                    entry_ref_completed = entry_ref
+                    is_exit_order = True
+                    exit_type = 'TP'
+                    other_ref = sltp_refs.get('sl')
+                    break
+
+            if is_exit_order and entry_ref_completed is not None:
+                self.log(f"EXIT Order {order_ref} ({exit_type}) for Entry {entry_ref_completed} Completed.", symbol=symbol)
+                # Cancel the other bracket order (TP or SL)
+                if other_ref:
+                    try:
+                        self.log(f"Attempting cancel of linked order {other_ref}", symbol=symbol)
+                        self.cancel(self.broker.orders_ref[other_ref])
+                    except KeyError:
+                        self.log(f"Linked order {other_ref} not found for cancellation (likely already filled/cancelled).", level=logging.WARNING, symbol=symbol)
+                    except Exception as e_cancel:
+                         self.log(f"Error cancelling linked order {other_ref}: {e_cancel}", level=logging.ERROR, symbol=symbol)
+                # Clean up tracking
+                if symbol in self.active_positions and self.active_positions[symbol] == entry_ref_completed:
+                    del self.active_positions[symbol]
+                if entry_ref_completed in self.linked_orders:
+                    del self.linked_orders[entry_ref_completed]
+
+            # Check if it's the main entry order that completed
+            elif self.order and order_ref == self.order.ref:
+                if order.isbuy(): self.log(f"BUY ENTRY {order_ref} Executed @{order.executed.price:.5f}, Size {order.executed.size}", symbol=symbol)
+                else: self.log(f"SELL ENTRY {order_ref} Executed @{order.executed.price:.5f}, Size {order.executed.size}", symbol=symbol)
+                # Mark position active
+                self.active_positions[symbol] = order_ref
+                # Link SL/TP orders (refs were stored temporarily in self.orders during execution)
+                sltp_refs = self.orders.pop(order_ref, None)
+                if sltp_refs: self.linked_orders[order_ref] = sltp_refs
+                else: self.log("SL/TP refs not found for completed entry order!", level=logging.WARNING, symbol=symbol)
+                # Reset pending entry order tracker
+                self.order = None
+                # Update cooldown and daily trade count
+                self.last_trade_time[symbol] = order.data.datetime.datetime(0)
+                current_day = order.data.datetime.date(0)
+                self.daily_trades[current_day] = self.daily_trades.get(current_day, 0) + 1
+            else:
+                 # If an order completes that isn't the pending entry or a tracked SL/TP, log it.
+                 self.log(f"Unknown Order {order_ref} Completed (Status: {order.Status[order.status]})", level=logging.WARNING, symbol=symbol)
+
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log(f"Order {order_ref} FAILED/CANCELLED: Status {order.Status[order.status]}", symbol=symbol)
+            failed_entry_ref = None
+            # If the pending entry order failed:
+            if self.order and order_ref == self.order.ref:
+                failed_entry_ref = order_ref
+                self.order = None # Clear pending order
+
+            # Check if an associated SL/TP order failed (less common unless rejected on submission)
+            for entry_ref, sltp_refs in list(self.linked_orders.items()):
+                 if order_ref == sltp_refs.get('sl') or order_ref == sltp_refs.get('tp'):
+                      self.log(f"CRITICAL: SL/TP order {order_ref} failed for active entry {entry_ref}!", level=logging.ERROR, symbol=symbol)
+                      # What action to take? Close position immediately? Alert?
+                      # For now, just remove tracking. Needs strategy decision.
+                      failed_entry_ref = entry_ref
+                      break
+
+            # If entry failed OR its SL/TP failed, cancel the linked orders and clear tracking
+            if failed_entry_ref:
+                 linked_refs = self.linked_orders.pop(failed_entry_ref, {})
+                 sl_ref_to_cancel = linked_refs.get('sl')
+                 tp_ref_to_cancel = linked_refs.get('tp')
+                 # Cancel the *other* one if it wasn't the one that failed
+                 if sl_ref_to_cancel and sl_ref_to_cancel != order_ref:
+                      try: self.cancel(self.broker.orders_ref[sl_ref_to_cancel])
+                      except KeyError: pass # Already gone
+                 if tp_ref_to_cancel and tp_ref_to_cancel != order_ref:
+                      try: self.cancel(self.broker.orders_ref[tp_ref_to_cancel])
+                      except KeyError: pass # Already gone
+                 # Ensure active position is cleared if entry failed or SL/TP failed
+                 if symbol in self.active_positions and self.active_positions[symbol] == failed_entry_ref:
+                      del self.active_positions[symbol]
+
+            # Clean up self.orders dict if the failed ref is a key there (shouldn't happen often)
+            if order_ref in self.orders: del self.orders[order_ref]
+
+
+    def notify_trade(self, trade):
+        """Log closed trade P&L info."""
+        if trade.isclosed:
+            symbol = self._get_symbol_from_data(trade.data) if trade.data else "Unknown"
+            self.log(f'TRADE CLOSED: Ref {trade.ref}, Symbol {symbol}, Profit Gross {trade.pnl:.2f}, Profit Net {trade.pnlcomm:.2f}', symbol=symbol)
+            # Update last loss time for cooldown calculation
+            if trade.pnlcomm < 0:
+                self.last_loss_time[symbol] = self.datas[0].datetime.datetime(0) # Time of trade close
+
+
+    # --- Signal Processing & Execution (Simplified) ---
+    def _process_signals(self):
+        """ Processes signals from SignalGenerator for all symbols. """
+        if self.order: return # Entry order already pending
+        if self._check_daily_trade_limit(): return
+
+        for data in self.datas: # Iterate through available data feeds
+            symbol = self._get_symbol_from_data(data)
+
+            # --- Pre-Signal Checks ---
+            if symbol in self.active_positions: continue # Position already open
+            if self._check_market_open_cooldown(data): continue
+            if self._check_trade_cooldown(symbol): continue
+
+            # --- Call Signal Generator ---
+            signal = None
+            # Determine standard timeframe name for the current data feed
+            bt_tf = data._timeframe
+            std_timeframe = self.signal_generator.reverse_tf_mapping.get(bt_tf, None) # Use SG's reverse map if available
+            if not std_timeframe:
+                tf_name = self._get_timeframe_from_data(data) # Fallback to name parsing
+                std_timeframe = self.signal_generator.reverse_tf_mapping.get(tf_name, tf_name) # Try again
+
+            if self.p.signal_generator:
+                try:
+                    # Prepare data - this remains a potential bottleneck/accuracy issue
+                    df = self._prepare_dataframe(data)
+                    real_time_data = self._simulate_real_time_data(data)
+                    current_time = data.datetime.datetime(0)
+
+                    if df is None or real_time_data is None:
+                         self.log(f"Skipping signal gen for {symbol} {std_timeframe}: Data prep failed", level=logging.WARNING, symbol=symbol)
+                         continue
+
+                    # Call the main signal generation method (using backtest adapter)
+                    signal_raw = self.p.signal_generator.generate_signal(
+                         symbol=symbol, timeframe=std_timeframe,
+                         ohlcv_data=df,
+                         real_time_data=real_time_data,
+                         # MS and OF instances are internal to SG in this design
+                    )
+
+                    # Check if signal is valid and accepted by upstream logic (SG/RM)
+                    if signal_raw and isinstance(signal_raw, dict) and signal_raw.get('accepted'):
+                         signal = signal_raw.get('adjusted_signal') # Get the final signal params
+                         if not signal: # If accepted=True but no adjusted_signal, log error
+                              self.log("Accepted signal missing 'adjusted_signal' details!", level=logging.ERROR, symbol=symbol)
+                              signal = None # Treat as invalid
+                    elif signal_raw and isinstance(signal_raw, dict) and not signal_raw.get('accepted'):
+                         self.log(f"Signal rejected by SG/RM: {signal_raw.get('reason', 'No reason given')}", level=logging.INFO, symbol=symbol)
+                         signal = None # Ensure signal is None if rejected
+                    else:
+                         # No signal generated or invalid format returned
+                         # self.log(f"No signal generated or invalid format for {symbol} {std_timeframe}", level=logging.DEBUG, symbol=symbol)
+                         signal = None
+
+                except Exception as e:
+                    self.log(f"Error during signal generation call for {symbol}: {e}", level=logging.ERROR, symbol=symbol)
+                    self.logger.debug(traceback.format_exc())
+                    signal = None
+
+            # --- Execute if we have a final, validated signal ---
+            if signal:
+                self.log(f"Attempting execution for accepted signal: {signal.get('action')} {symbol}", symbol=symbol)
+                self._execute_trade(data, signal)
+
+
+    def _execute_trade(self, data, signal: Dict[str, Any]):
+        """ Executes trade based on fully validated signal from upstream. """
+        if self.order:
+            self.log("Execution skipped: Entry order already pending.", symbol=signal.get('symbol'))
+            return
+
+        symbol = signal['symbol']
+        action = signal['action']
+        size = signal['volume'] # Use volume from signal
+        sl_price = signal.get('stop_loss') # Use SL from signal
+        tp_price = signal.get('take_profit') # Use TP from signal
+
+        # Final validation of essential execution params
+        if not all([action in ['buy', 'sell'], isinstance(size, (int,float)), size > 0,
+                    isinstance(sl_price, (int, float)), isinstance(tp_price, (int, float))]):
+            self.log(f"Invalid execution parameters in final signal: Size={size} SL={sl_price} TP={tp_price}", level=logging.ERROR, symbol=symbol)
+            return
+
+        entry_order = None
+        sl_order = None
+        tp_order = None
+        entry_ref = None
+        sl_ref = None
+        tp_ref = None
+
+        try:
+            # Use current close as reference for logging, actual fill might differ slightly
+            ref_price = data.close[0]
+            if action == 'buy':
+                self.log(f"EXECUTE BUY: Size={size:.2f} @ Market (~{ref_price:.5f}), SL={sl_price:.5f}, TP={tp_price:.5f}", symbol=symbol)
+                entry_order = self.buy(data=data, size=size, exectype=bt.Order.Market)
+                sl_order = self.sell(data=data, size=size, exectype=bt.Order.Stop, price=sl_price)
+                tp_order = self.sell(data=data, size=size, exectype=bt.Order.Limit, price=tp_price)
+            elif action == 'sell':
+                self.log(f"EXECUTE SELL: Size={size:.2f} @ Market (~{ref_price:.5f}), SL={sl_price:.5f}, TP={tp_price:.5f}", symbol=symbol)
+                entry_order = self.sell(data=data, size=size, exectype=bt.Order.Market)
+                sl_order = self.buy(data=data, size=size, exectype=bt.Order.Stop, price=sl_price)
+                tp_order = self.buy(data=data, size=size, exectype=bt.Order.Limit, price=tp_price)
+
+            # Store references immediately if orders were created
+            if entry_order: entry_ref = entry_order.ref
+            if sl_order: sl_ref = sl_order.ref
+            if tp_order: tp_ref = tp_order.ref
+
+            if entry_ref and sl_ref and tp_ref:
+                 self.order = entry_order # Track main order as pending
+                 # Store refs of linked SL/TP orders, keyed by entry order ref
+                 self.orders[entry_ref] = {'sl': sl_ref, 'tp': tp_ref}
+                 self.log(f"Entry ({entry_ref}), SL ({sl_ref}), TP ({tp_ref}) submitted.", symbol=symbol)
+            else:
+                 # If any order failed submission (e.g., validation error in Backtrader), log error
+                 self.log("Failed to submit one or more orders for the trade.", level=logging.ERROR, symbol=symbol)
+                 # Attempt to cancel any orders that *were* submitted successfully
+                 for ord_obj in [entry_order, sl_order, tp_order]:
+                      if ord_obj: self.cancel(ord_obj)
+                 self.order = None # Ensure main order tracker is clear
+
+        except Exception as e:
+            self.log(f"Exception during order submission: {e}", level=logging.ERROR, symbol=symbol)
+            self.order = None # Ensure main order tracker is clear
+
+    # --- Main Loop (`next`) ---
+    def next(self):
+        """ Main strategy logic loop called for each bar. """
+        # Reset daily trade count on new day
+        current_day = self.datas[0].datetime.date(0)
+        if getattr(self, 'last_day', None) != current_day:
+            self.daily_trades[current_day] = 0
+            self.last_day = current_day
+
+        # Primary action is processing potential signals
+        self._process_signals()
+
+        # --- Optional: Position Management Logic (If NOT handled by SL/TP orders alone) ---
+        # Example: Time-based exit for any open position
+        # max_bars_in_trade = self.params.get('max_bars_in_trade', 100)
+        # for symbol, entry_ref in list(self.active_positions.items()):
+        #      # Need a robust way to link entry_ref back to the position object
+        #      # This might require iterating self.broker.positions or storing more info
+        #      # Simplified check based on entry time (less accurate than bar count):
+        #      entry_time = self.broker.orders_ref[entry_ref].executed.dt # Get execution time
+        #      current_time = self.datas[0].datetime.datetime(0)
+        #      if (current_time - entry_time).total_seconds() > max_bars_in_trade * self.datas[0].timedelta.total_seconds(): # Approx bar count
+        #            position_to_close = self.getpositionbyref(entry_ref) # Get position by ref
+        #            if position_to_close:
+        #                 self.log(f"Closing position {entry_ref} for {symbol} due to time limit", symbol=symbol)
+        #                 self.close(data=position_to_close.data)
+
+
+    # --- Strategy Stop Method ---
+    def stop(self):
+        """ Log final results when strategy stops. """
+        # --- Use logic from cite: 128-131 ---
+        start_cash = self.broker.startingcash
+        end_value = self.broker.getvalue()
+        pnl = end_value - start_cash
+        ret = (end_value / start_cash - 1.0) * 100.0 if start_cash != 0 else 0.0
+
+        trade_analysis = {}
+        try:
+            # Try accessing analyzers added by Backtesting module
+            if hasattr(self.analyzers, 'trades') and self.analyzers.trades.get_analysis():
+                 trade_analysis = self.analyzers.trades.get_analysis()
+                 # Fix extraction logic again if necessary based on actual structure
+                 total_trades = trade_analysis.total.total if hasattr(trade_analysis.total,'total') else 0
+                 won_trades = trade_analysis.won.total if hasattr(trade_analysis.won,'total') else 0
+                 lost_trades = trade_analysis.lost.total if hasattr(trade_analysis.lost,'total') else 0
+                 win_rate = (won_trades / total_trades * 100) if total_trades > 0 else 0
+                 avg_win = trade_analysis.won.pnl.average if won_trades > 0 and hasattr(trade_analysis.won.pnl,'average') else 0
+                 avg_loss = trade_analysis.lost.pnl.average if lost_trades > 0 and hasattr(trade_analysis.lost.pnl,'average') else 0
+                 profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+
+                 self.logger.info("----- Strategy Performance (From Analyzers) -----")
+                 self.logger.info(f"Total Trades: {total_trades}")
+                 self.logger.info(f"Win Rate: {win_rate:.2f}% ({won_trades}/{lost_trades})")
+                 self.logger.info(f"Avg Win / Avg Loss: ${avg_win:.2f} / ${abs(avg_loss):.2f}")
+                 self.logger.info(f"Profit Factor: {profit_factor:.2f}")
+            else:
+                 self.logger.info("----- Strategy Performance (Basic) -----")
+                 self.logger.info("(TradeAnalyzer results not available)")
+
+        except Exception as e_stop:
+             self.logger.error(f"Error accessing analyzers in stop(): {e_stop}")
+             self.logger.info("----- Strategy Performance (Basic) -----")
+
+        self.logger.info(f"Starting Balance: ${start_cash:.2f}")
+        self.logger.info(f"Final Balance:    ${end_value:.2f}")
+        self.logger.info(f"Net Profit/Loss:  ${pnl:.2f}")
+        self.logger.info(f"Total Return:     {ret:.2f}%")
+        self.logger.info("-------------------------------------------------")
+
+
+    # --- Keep Necessary Helper Methods ---
+    def _get_symbol_from_data(self, data):
+        # --- Use implementation from cite: 11-12 ---
+        if hasattr(data, '_name'):
+            return data._name.split('_')[0] # Assuming NAME_TIMEFRAME format
+        for i, d in enumerate(self.datas):
+            if d == data: return f"data_{i}" # Fallback
+        return "unknown"
+
+    def _get_timeframe_from_data(self, data):
+        # --- Use implementation from cite: 12-13 ---
+        # Needs mapping from Backtrader timeframe (e.g., Minutes, Days) and compression back to string
+        if hasattr(data, '_timeframe') and hasattr(data, '_compression'):
+             tf_enum = data._timeframe
+             comp = data._compression
+             if tf_enum == bt.TimeFrame.Minutes: return f"{comp}min"
+             if tf_enum == bt.TimeFrame.Hourly: return f"{comp}h"
+             if tf_enum == bt.TimeFrame.Daily: return "daily"
+             # Add other Backtrader timeframes if needed
+        if hasattr(data, '_name'): # Fallback to name parsing
+             parts = data._name.split('_')
+             if len(parts) > 1: return parts[1] # Assuming NAME_TIMEFRAME
+        return "unknown"
+
+    def log(self, txt, dt=None, symbol=None, level=logging.INFO):
+        # --- Use implementation from previous example ---
+        dt_log = dt or self.datas[0].datetime.datetime(0) if self.datas and len(self.datas[0]) else datetime.now(pytz.UTC)
+        symbol_str = f"[{symbol}] " if symbol else ""
+        try:
+            self.logger.log(level, f'{dt_log.isoformat()} - {symbol_str}{txt}')
+        except Exception as e_log:
+            print(f"LOGGING FAILED: {dt_log} - {symbol_str}{txt} ({e_log})") # Fallback print
+
+
+    def _check_daily_trade_limit(self):
+        # --- Use implementation from cite: 66-67 ---
+        if self.p.max_trades_per_day <= 0: return False
+        current_day = self.datas[0].datetime.date(0)
+        daily_count = self.daily_trades.get(current_day, 0)
+        limit_reached = daily_count >= self.p.max_trades_per_day
+        if limit_reached:
+            # Log only once per day? Add a flag.
+            if getattr(self, f'_logged_limit_{current_day}', False) == False:
+                 self.log(f"Daily trade limit reached: {daily_count}/{self.p.max_trades_per_day} for {current_day}")
+                 setattr(self, f'_logged_limit_{current_day}', True)
+        return limit_reached
+
+    def _check_market_open_cooldown(self, data):
+        # --- Use implementation from cite: 67-74 ---
+        # Note: This logic relies on exact time matching (e.g., 9:30) which might be fragile.
+        # Consider checking if the bar *contains* the session start time instead.
+        symbol = self._get_symbol_from_data(data)
+        current_time_dt = data.datetime.datetime(0) # Use bar timestamp from data feed
+
+        cooldown_minutes = self.p.market_open_cooldown_minutes
+        if cooldown_minutes <= 0: return False
+
+        # Simple check: if it's the start of the data feed (first N bars), apply cooldown
+        if len(data) < cooldown_minutes + 5: # Apply cooldown for first N bars approx
+            # self.log(f"Initial market open cooldown active (bar {len(data)})", symbol=symbol, level=logging.DEBUG)
+            return True # Simplistic approach for backtesting start
+
+        # More complex session detection might be needed for real accuracy across markets/timezones
+        # The logic from cite: 67-74 based on hardcoded hours is removed as it's unreliable
+
+        return False # Default to no cooldown if not at start
+
+    def _check_trade_cooldown(self, symbol):
+        # --- Use implementation from cite: 74-80 ---
+        current_time_dt = self.datas[0].datetime.datetime(0) # Use current bar time
+        cooldown_minutes = self.p.trade_cooldown_minutes
+        if cooldown_minutes <= 0: return False
+
+        last_trade = self.last_trade_time.get(symbol)
+        if not last_trade: return False
+
+        minutes_since_trade = (current_time_dt - last_trade).total_seconds() / 60.0
+
+        required_cooldown = cooldown_minutes
+        last_loss = self.last_loss_time.get(symbol)
+        # Check if the last loss occurred at or after the last trade for this symbol
+        if last_loss and last_loss >= last_trade:
+            required_cooldown *= self.p.loss_cooldown_multiplier
+
+        if minutes_since_trade < required_cooldown:
+            # Log less frequently to avoid spam
+            if len(self) % 5 == 0: # Example: log every 5 bars if still in cooldown
+                 self.log(f"Trade cooldown active: {minutes_since_trade:.1f}m of {required_cooldown:.1f}m elapsed", symbol=symbol, level=logging.DEBUG)
+            return True
+
+        return False

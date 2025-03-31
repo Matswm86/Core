@@ -1,0 +1,676 @@
+# Necessary Imports (ensure all are installed)
+import logging
+import pandas as pd
+import numpy as np
+import os
+import pytz
+import time
+import MetaTrader5 as mt5 # Keep if using MT5 API directly
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple # Added Tuple
+from functools import lru_cache
+# Example imports for enhancements (uncomment if implemented)
+# from statsmodels.tsa.stattools import adfuller, kpss
+# from sklearn.decomposition import PCA
+# from sklearn.preprocessing import StandardScaler
+
+class DataIngestion:
+    """
+    Data Ingestion module for both historical and live market data.
+    Handles data loading, caching, validation, gap repair, and basic preprocessing (e.g., stationarity tests).
+    """
+
+    def __init__(self, config, mt5_api=None):
+        """
+        Initialize DataIngestion with configuration settings.
+        """
+        self.config = config
+        self.config_di = config.get('data_ingestion', {}) # DI specific config
+        self._validate_config() # Validate top-level config
+
+        # Extract configuration parameters
+        self.data_dir = self.config_di.get('historical_data_path', '.')
+        self.timeframes_files = self.config_di.get('timeframe_files', {}) # Mapping TF -> filename
+        self.delimiter = self.config_di.get('delimiter', ',')
+        self.column_names = self.config_di.get('column_names', ["datetime", "Open", "High", "Low", "Close", "Volume"])
+        self.live_mode = self.config.get('central_trading_bot', {}).get('mode') == 'live'
+        self.symbols = self.config.get('symbols', [])
+        self.logger = logging.getLogger(__name__)
+        self.mt5_api = mt5_api # MT5 API instance passed in
+
+        # Timeframes expected by the system (used for iteration/validation)
+        # Should probably get this from signal_generation config for consistency
+        self.system_timeframes = self.config.get('signal_generation', {}).get('timeframes', [])
+
+        # --- Parameters for Enhancements ---
+        self.stationarity_p_value_threshold = self.config_di.get('stationarity_p_value_threshold', 0.05)
+        self.pca_n_components = self.config_di.get('pca_n_components', 3) # Example for PCA
+        self.gap_repair_timeout = self.config_di.get('gap_repair_timeout', 30) # Timeout for gap repair
+        self.gap_repair_max_perc = self.config_di.get('gap_repair_max_perc', 50) # Max % gaps before skipping repair
+        self.validation_max_anomalies_perc = self.config_di.get('validation_max_anomalies_perc', 3) # Allow N% anomalies
+        self.validation_max_identical_bars = self.config_di.get('validation_max_identical_bars', 3) # Max identical bars
+
+        # Initialize data cache with tuned expiry
+        self.data_cache = {}
+        self.cache_expiry = {}
+        # Use explicit defaults, allow override from config
+        default_cache_age = {
+            'tick': timedelta(seconds=5), '1min': timedelta(minutes=1), '5min': timedelta(minutes=1),
+            '15min': timedelta(minutes=2), '30min': timedelta(minutes=5), '1h': timedelta(minutes=10),
+            '4h': timedelta(minutes=30), 'daily': timedelta(hours=1)
+        }
+        self.max_cache_age = self.config_di.get('cache_expiry_settings', default_cache_age)
+        # Ensure durations are timedelta objects if loaded from config strings
+        for tf, age in self.max_cache_age.items():
+            if isinstance(age, (int, float)): self.max_cache_age[tf] = timedelta(seconds=age)
+            elif isinstance(age, str): self.max_cache_age[tf] = pd.to_timedelta(age) # Handle duration strings
+
+        # Map string timeframes to MT5 timeframe constants
+        self.timeframe_map = {
+            '1min': mt5.TIMEFRAME_M1, '5min': mt5.TIMEFRAME_M5, '15min': mt5.TIMEFRAME_M15,
+            '30min': mt5.TIMEFRAME_M30, '1h': mt5.TIMEFRAME_H1, '4h': mt5.TIMEFRAME_H4,
+            'daily': mt5.TIMEFRAME_D1
+        }
+
+        # Log initialization
+        mode = "live" if self.live_mode else "backtest"
+        source = "MT5 API" if self.live_mode else f"CSV ({self.data_dir})"
+        self.logger.info(f"DataIngestion initialized in {mode} mode for symbols: {', '.join(self.symbols)}. Data source: {source}")
+
+    def _validate_config(self):
+        """Validate configuration parameters"""
+        # --- Using implementation from Dataingestion (1).txt---
+        required_keys = ['central_trading_bot', 'symbols']
+        for key in required_keys:
+            if key not in self.config:
+                raise ValueError(f"Missing required configuration key: {key}")
+
+        if not isinstance(self.config.get('symbols', []), list) or not self.config.get('symbols'):
+            raise ValueError("Configuration must include a non-empty 'symbols' list")
+
+        if self.config.get('central_trading_bot', {}).get('mode') not in ['live', 'backtest']:
+            raise ValueError("Trading mode must be either 'live' or 'backtest'")
+        # Add more config validation as needed (e.g., check paths, timeframe mapping)
+
+
+    def load_historical_data(self, symbols_to_load: Optional[List[str]] = None,
+                             repair_gaps=True, interpolate_missing=True,
+                             run_stationarity_tests=False, calc_basic_features=False):
+        """
+        Load historical data from CSV files for backtesting with advanced validation and repair.
+
+        Args:
+            symbols_to_load (Optional[List[str]]): Specific symbols to load (if None, uses backtest symbols from config).
+            repair_gaps (bool): Whether to repair timestamp gaps in the data.
+            interpolate_missing (bool): Whether to interpolate missing values during gap repair.
+            run_stationarity_tests (bool): Whether to perform ADF/KPSS tests after loading.
+            calc_basic_features (bool): Whether to calculate basic features (e.g., returns) after loading.
+
+        Returns:
+            dict: A dictionary mapping (symbol, timeframe) to their corresponding processed DataFrames (or None on failure).
+        """
+        if self.live_mode:
+            self.logger.debug("Historical data loading skipped in live mode")
+            return {}
+
+        historical_data = {}
+        # Determine symbols to load
+        if symbols_to_load:
+            target_symbols = [s for s in symbols_to_load if s in self.symbols] # Ensure requested symbols are configured
+        else:
+            target_symbols = self.config.get('backtesting', {}).get('symbols', [])
+            if not target_symbols:
+                target_symbols = self.config.get('symbols', []) # Fallback to all symbols
+            self.logger.info(f"Loading data for configured backtest symbols: {target_symbols}")
+
+        if not target_symbols:
+            self.logger.error("No symbols configured or requested for historical data loading.")
+            return {}
+
+        # Use the configured timeframe->filename mapping
+        target_timeframes = self.timeframes_files.keys()
+        if not target_timeframes:
+             self.logger.error("No timeframe_files mapping found in data_ingestion config.")
+             return {}
+
+        self.logger.info(f"Loading historical data for {len(target_symbols)} symbols and {len(target_timeframes)} timeframes")
+
+        for symbol in target_symbols:
+            for tf in target_timeframes:
+                if tf not in self.system_timeframes: # Check if TF is used by system
+                     self.logger.debug(f"Skipping load for timeframe {tf} not in system_timeframes.")
+                     continue
+
+                filename = self.timeframes_files.get(tf)
+                if not filename:
+                     self.logger.warning(f"No filename configured for timeframe {tf} in timeframe_files.")
+                     continue
+
+                file_path = os.path.join(self.data_dir, filename)
+                df_processed = None # Flag for successful processing
+
+                try:
+                    # --- File Existence and Loading Logic (Improved) ---
+                    actual_file_path = self._find_data_file(symbol, tf, filename)
+                    if not actual_file_path:
+                        historical_data[(symbol, tf)] = None
+                        continue # Log handled in _find_data_file
+
+                    if os.path.getsize(actual_file_path) == 0:
+                        self.logger.error(f"File is empty: {actual_file_path}")
+                        historical_data[(symbol, tf)] = None
+                        continue
+
+                    # --- Load and Standardize ---
+                    df_loaded = self._load_and_standardize_csv(actual_file_path, symbol, tf)
+                    if df_loaded is None:
+                        historical_data[(symbol, tf)] = None
+                        continue
+
+                    # --- Validate ---
+                    validation_report = self._validate_dataframe(df_loaded, symbol) # Get structured report
+                    if not validation_report['valid']:
+                        self.logger.warning(f"Data validation issues in {actual_file_path}: {validation_report['reason']}")
+                        if validation_report.get('critical', False):
+                             self.logger.error(f"CRITICAL validation failure for {symbol} {tf}, skipping.")
+                             historical_data[(symbol, tf)] = None
+                             continue
+                        # Continue with warnings for non-critical issues
+
+                    # --- Sort & Filter ---
+                    df_processed = df_loaded.sort_index()
+                    df_processed = self._apply_date_filters(df_processed, symbol, tf) # Apply start/end date
+
+                    if df_processed.empty:
+                         self.logger.warning(f"No data remaining for {symbol} {tf} after date filtering.")
+                         historical_data[(symbol, tf)] = None
+                         continue
+
+                    # --- Repair Gaps ---
+                    if repair_gaps:
+                        df_processed = self._repair_data_gaps(df_processed, symbol, tf, interpolate_missing)
+
+                    # --- Optional Post-Processing ---
+                    if run_stationarity_tests:
+                        stationarity_results = self._perform_stationarity_tests(df_processed)
+                        df_processed.attrs['stationarity'] = stationarity_results # Attach results as metadata
+
+                    if calc_basic_features:
+                        df_processed = self._calculate_basic_features(df_processed)
+
+                    # --- Store Result ---
+                    historical_data[(symbol, tf)] = df_processed
+                    self.logger.info(f"Loaded {symbol} {tf} from {actual_file_path}: {len(df_processed)} rows")
+
+                except Exception as e:
+                    self.logger.error(f"Unhandled error loading {file_path} for {symbol} {tf}: {str(e)}")
+                    self.logger.debug(traceback.format_exc())
+                    historical_data[(symbol, tf)] = None
+
+        loaded_count = sum(1 for df in historical_data.values() if df is not None)
+        total_requested = len(target_symbols) * len([tf for tf in target_timeframes if tf in self.system_timeframes])
+        if loaded_count < total_requested:
+            self.logger.warning(f"Only loaded {loaded_count}/{total_requested} requested historical datasets")
+        else:
+            self.logger.info(f"Successfully loaded all {total_requested} requested historical datasets")
+
+        return historical_data
+
+    # --- Helper for finding file ---
+    def _find_data_file(self, symbol: str, timeframe: str, primary_filename: str) -> Optional[str]:
+        """Checks primary path and alternates, returns valid path or None."""
+        primary_path = os.path.join(self.data_dir, primary_filename)
+        if os.path.exists(primary_path):
+             return primary_path
+
+        # Try alternate patterns (similar to original code)
+        alternate_patterns = [
+             f"{symbol}_{timeframe}.csv", f"{symbol.lower()}_{timeframe}.csv",
+             f"{symbol}_{timeframe.lower()}.csv", os.path.join(timeframe, f"{symbol}.csv"),
+             os.path.join(symbol, f"{timeframe}.csv") # Another common structure
+        ]
+        for pattern in alternate_patterns:
+             alt_path = os.path.join(self.data_dir, pattern)
+             if os.path.exists(alt_path):
+                  self.logger.info(f"Using alternate file path for {symbol} {timeframe}: {alt_path}")
+                  return alt_path
+
+        self.logger.error(f"File not found for {symbol} {timeframe}: Checked primary '{primary_path}' and alternates.")
+        return None
+
+    # --- Helper for loading/standardizing CSV ---
+    def _load_and_standardize_csv(self, file_path: str, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """Loads CSV, attempts parsing, standardizes columns, sets index."""
+        try:
+            try: # Try configured format first
+                df = pd.read_csv(
+                    file_path, delimiter=self.delimiter, header=0,
+                    names=self.column_names, parse_dates=['datetime'], low_memory=False
+                 )
+            except (ValueError, TypeError, KeyError): # Catch specific pandas/parsing errors
+                self.logger.warning(f"Configured format failed for {file_path}, trying auto-detection...")
+                df = pd.read_csv(file_path, low_memory=False) # Try auto-detect
+
+            if df.empty: return None
+
+            # Find and parse datetime column
+            datetime_col_found = None
+            datetime_col_candidates = ['datetime', 'date', 'time', 'timestamp', 'Date', 'Time', 'Timestamp']
+            for col_name in datetime_col_candidates:
+                 if col_name in df.columns:
+                      try:
+                           # Attempt flexible parsing, infer format if possible
+                           df[col_name] = pd.to_datetime(df[col_name], infer_datetime_format=True)
+                           datetime_col_found = col_name
+                           break # Found and parsed successfully
+                      except Exception as e_parse:
+                           self.logger.warning(f"Could not auto-parse datetime column '{col_name}' in {file_path}: {e_parse}")
+            if not datetime_col_found:
+                 self.logger.error(f"No suitable datetime column found or parsed in {file_path}")
+                 return None
+            df = df.rename(columns={datetime_col_found: 'datetime'})
+
+            # Set index and ensure timezone (assume UTC if none)
+            df = df.set_index('datetime', drop=False)
+            if df.index.tz is None:
+                df = df.tz_localize('UTC')
+            else:
+                 df = df.index.tz_convert('UTC') # Convert to UTC if different TZ present
+
+
+            # Standardize OHLCV columns (case-insensitive)
+            required_map = {'open': ['open','Open'], 'high': ['high','High'], 'low': ['low','Low'],
+                            'close': ['close','Close'], 'volume': ['volume','Volume','vol']}
+            column_mapping = {}
+            missing_req = []
+            for std_name, possible_names in required_map.items():
+                 found = False
+                 for name in possible_names:
+                      if name in df.columns:
+                           column_mapping[std_name] = name
+                           found = True
+                           break
+                 if not found:
+                      missing_req.append(std_name)
+
+            if missing_req:
+                 self.logger.error(f"Missing required columns: {missing_req} in {file_path}")
+                 return None
+
+            # Select and rename standard columns + original datetime
+            standard_cols_map = {v: k for k, v in column_mapping.items()}
+            df_std = df[list(column_mapping.values()) + ['datetime']].rename(columns=standard_cols_map)
+
+            # Convert to numeric, coercing errors
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                 df_std[col] = pd.to_numeric(df_std[col], errors='coerce')
+
+            return df_std
+
+        except pd.errors.EmptyDataError:
+            self.logger.error(f"Empty data file (pandas error): {file_path}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error loading/standardizing {file_path}: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return None
+
+    # --- Helper for Date Filtering ---
+    def _apply_date_filters(self, df: pd.DataFrame, symbol: str, timeframe: str) -> pd.DataFrame:
+         """Applies start/end date filters from backtesting config."""
+         if self.live_mode: return df # No filtering in live mode
+
+         backtest_config = self.config.get('backtesting', {})
+         start_date = backtest_config.get('start_date')
+         end_date = backtest_config.get('end_date')
+
+         df_filtered = df # Start with original
+
+         if start_date:
+              try:
+                   start_dt = pd.to_datetime(start_date).tz_localize('UTC') # Assume UTC
+                   original_size = len(df_filtered)
+                   df_filtered = df_filtered[df_filtered.index >= start_dt]
+                   self.logger.info(f"Applied start date filter ({start_dt.date()}) to {symbol} {timeframe}: {original_size} -> {len(df_filtered)} rows")
+              except Exception as e:
+                   self.logger.warning(f"Error applying start date filter to {symbol} {timeframe}: {str(e)}")
+
+         if end_date:
+              try:
+                   # End date is typically exclusive, adjust to include the full day
+                   end_dt = pd.to_datetime(end_date).tz_localize('UTC') + timedelta(days=1)
+                   original_size = len(df_filtered)
+                   df_filtered = df_filtered[df_filtered.index < end_dt]
+                   self.logger.info(f"Applied end date filter ({end_dt.date() - timedelta(days=1)}) to {symbol} {timeframe}: {original_size} -> {len(df_filtered)} rows")
+              except Exception as e:
+                   self.logger.warning(f"Error applying end date filter to {symbol} {timeframe}: {str(e)}")
+
+         return df_filtered
+
+
+    # --- Data Repair & Validation (Keep existing, potentially enhance reporting) ---
+    def _repair_data_gaps(self, df, symbol, timeframe, interpolate_missing=True):
+        """Identify and repair gaps in time series data."""
+        # --- Using implementation from Dataingestion (1).txt---
+        # Added timeout param, check for futures logic remains good.
+        # Consider making interpolation methods configurable.
+        start_time_outer = time.time() # For overall timeout
+        if df.empty or not isinstance(df.index, pd.DatetimeIndex): return df
+
+        freq = self._get_frequency_string(timeframe)
+        if not freq:
+            self.logger.warning(f"Unknown timeframe frequency for gap repair: {timeframe}")
+            return df
+
+        try:
+            df_repaired = df.copy()
+            if df_repaired.index.tz is None: df_repaired.index.tz_localize('UTC')
+
+            # Create the expected full range index
+            expected_index = pd.date_range(start=df_repaired.index.min(), end=df_repaired.index.max(), freq=freq)
+            df_repaired = df_repaired.reindex(expected_index) # Reindex to introduce NaNs for missing timestamps
+
+            missing_mask = df_repaired['open'].isna() # Use 'open' or another core column to find NaNs
+            gap_count = missing_mask.sum()
+
+            if gap_count == 0: return df # No gaps found
+
+            gap_percent = (gap_count / len(expected_index)) * 100
+            self.logger.info(f"Found {gap_count} timestamp gaps ({gap_percent:.2f}%) in {symbol} {timeframe} data before repair.")
+
+            # Check for excessive gaps
+            if gap_percent > self.gap_repair_max_perc:
+                self.logger.warning(f"Excessive gaps detected ({gap_percent:.2f}% > {self.gap_repair_max_perc}%) in {symbol} {timeframe} data - skipping repair.")
+                # Check for futures pattern (weekends/holidays)
+                # This check could be more sophisticated (e.g., check day of week)
+                is_futures = self.config.get('symbol_settings', {}).get(symbol, {}).get('is_futures', False)
+                if is_futures:
+                     self.logger.info(f"Skipping repair likely due to non-trading periods for futures {symbol}")
+                     return df # Return original df if skipping repair for futures
+                else:
+                     return df_repaired # Return df with NaNs if not futures and gap too large
+
+
+            if interpolate_missing:
+                 self.logger.info(f"Attempting interpolation for {gap_count} gaps in {symbol} {timeframe}...")
+                 # Fill Volume first (set to 0)
+                 if 'volume' in df_repaired.columns:
+                      df_repaired['volume'].fillna(0, inplace=True)
+
+                 # Forward fill previous close to current open for gaps
+                 # Ensure 'close' exists before trying to access it
+                 if 'close' in df_repaired.columns:
+                      # Create a temporary column for previous close
+                      df_repaired['prev_close_temp'] = df_repaired['close'].shift(1)
+                      # Fill NaN 'open' values with the previous close
+                      df_repaired['open'].fillna(df_repaired['prev_close_temp'], inplace=True)
+                      df_repaired.drop(columns=['prev_close_temp'], inplace=True)
+                 else:
+                      # Fallback if 'close' is missing: ffill 'open'
+                      df_repaired['open'].fillna(method='ffill', inplace=True)
+
+                 # Use forward fill for low and high initially to provide base values
+                 df_repaired['low'].fillna(method='ffill', inplace=True)
+                 df_repaired['high'].fillna(method='ffill', inplace=True)
+                 # Forward fill close as well
+                 df_repaired['close'].fillna(method='ffill', inplace=True)
+
+                 # Ensure OHLC consistency after ffill (important!)
+                 # High must be >= Open, Close; Low must be <= Open, Close
+                 df_repaired['high'] = df_repaired[['high', 'open', 'close']].max(axis=1)
+                 df_repaired['low'] = df_repaired[['low', 'open', 'close']].min(axis=1)
+
+                 # Final check for NaNs - should only be at the very start if any
+                 if df_repaired.iloc[0].isna().any():
+                      df_repaired.fillna(method='bfill', limit=1, inplace=True) # Backfill first row only if needed
+
+                 self.logger.info(f"Finished interpolation for {symbol} {timeframe}.")
+
+            else: # Not interpolating, just leave NaNs
+                 self.logger.info(f"Identified {gap_count} gaps in {symbol} {timeframe} data (interpolation disabled).")
+
+            # Enforce final OHLC consistency
+            df_repaired = self._enforce_ohlc_relationships(df_repaired)
+            # Restore datetime column if lost during reindex (unlikely with level=0 but safe)
+            if 'datetime' not in df_repaired.columns and isinstance(df_repaired.index, pd.DatetimeIndex):
+                 df_repaired['datetime'] = df_repaired.index
+
+            # Timeout check
+            if (time.time() - start_time_outer) > self.gap_repair_timeout:
+                 self.logger.warning(f"Gap repair for {symbol} {timeframe} exceeded timeout ({self.gap_repair_timeout}s). Returning potentially incomplete repair.")
+                 # Return what we have, even if timeout hit during processing
+                 return df_repaired
+
+            return df_repaired
+
+        except Exception as e:
+            self.logger.error(f"Error repairing gaps for {symbol} {timeframe}: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return df # Return original dataframe on error
+
+
+    def _enforce_ohlc_relationships(self, df):
+        """Ensure High >= Max(Open, Close) and Low <= Min(Open, Close)."""
+        # --- Using implementation from Dataingestion (1).txt---
+        try:
+            required = ['open', 'high', 'low', 'close']
+            if not all(col in df.columns and not df[col].isna().all() for col in required):
+                self.logger.debug("Skipping OHLC enforcement due to missing/all-NaN columns.")
+                return df
+
+            df_copy = df.copy() # Work on copy
+
+            # Ensure high is highest, handling NaNs
+            df_copy['high'] = df_copy[['open', 'high', 'close']].max(axis=1, skipna=False)
+            # Ensure low is lowest, handling NaNs
+            df_copy['low'] = df_copy[['open', 'low', 'close']].min(axis=1, skipna=False)
+            # Ensure low <= high
+            df_copy['low'] = np.minimum(df_copy['low'], df_copy['high'])
+
+            return df_copy
+
+        except Exception as e:
+            self.logger.error(f"Error enforcing OHLC relationships: {str(e)}")
+            return df # Return original on error
+
+
+    def _validate_dataframe(self, df, symbol) -> Dict:
+        """Validate dataframe contents, return structured report."""
+        # --- Based on implementation from Dataingestion (1).txt---
+        # Modified to return a dictionary report
+        report = {'valid': True, 'critical': False, 'reason': '', 'details': {}}
+        issues = []
+
+        if df.empty:
+            report['valid'] = False
+            report['critical'] = True # Empty DF after load usually critical
+            report['reason'] = "Empty DataFrame"
+            return report
+
+        symbol_settings = self.config.get('symbol_settings', {}).get(symbol, {})
+        min_price = symbol_settings.get('min_price', 0.0001)
+        max_price = symbol_settings.get('max_price', 1000000.0)
+        max_volume = symbol_settings.get('max_volume', 1000000000.0) # Increased default max volume
+
+        missing_values = df.isnull().sum()
+        total_missing = missing_values.sum()
+        if total_missing > 0:
+            issues.append(f"Total {total_missing} missing values")
+            report['details']['missing_values'] = missing_values[missing_values > 0].to_dict()
+            # Decide if missing values are critical based on count/columns
+
+        for col in ['open', 'high', 'low', 'close']:
+            if col in df.columns:
+                if df[col].lt(min_price).any(): issues.append(f"{col} < {min_price}")
+                if df[col].gt(max_price).any(): issues.append(f"{col} > {max_price}")
+
+        if 'volume' in df.columns:
+            if df['volume'].lt(0).any():
+                 issues.append("Negative volume found")
+                 report['critical'] = True # Negative volume is critical
+            if df['volume'].gt(max_volume).any(): issues.append(f"Volume > {max_volume}")
+
+        if all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+            if df['high'].lt(df['low']).any():
+                 issues.append("High < Low found")
+                 report['critical'] = True # H < L is critical
+            if (df['high'].lt(df['open']) | df['high'].lt(df['close'])).any():
+                 issues.append("High not highest")
+            if (df['low'].gt(df['open']) | df['low'].gt(df['close'])).any():
+                 issues.append("Low not lowest")
+
+        if issues:
+            report['valid'] = False # Mark as invalid if any issues found
+            report['reason'] = "; ".join(issues[:3]) + ("..." if len(issues)>3 else "") # Summarize first few issues
+
+        return report
+
+    # --- Live Data Fetching Methods ---
+    # (Keep fetch_live_data, _validate_tick, get_ohlc, _validate_ohlc, get_dom, _validate_dom)
+    # --- Use implementations from Dataingestion (1).txt [cite: 101-124, 124-142, 142-162, 162-189, 189-205, 205-223] ---
+    # Consider adding tick processing / delta calculation / DOM metrics within these if needed.
+
+    def fetch_live_data(self, symbol, max_retries=2, retry_delay=0.5):
+        # ... [Implementation from cite: 101-124] ...
+        pass # Replace with full implementation
+
+    def _validate_tick(self, tick, symbol):
+        # ... [Implementation from cite: 124-142, return dict report] ...
+        pass # Replace with full implementation
+
+    def get_ohlc(self, symbol, timeframe=None, count=100, use_cache=True, max_retries=2):
+        # ... [Implementation from cite: 142-162] ...
+        pass # Replace with full implementation
+
+    def _validate_ohlc(self, ohlc_data, symbol):
+        # ... [Implementation from cite: 162-189, return dict report] ...
+        pass # Replace with full implementation
+
+    def get_dom(self, symbol, max_retries=2, retry_delay=0.5):
+        # ... [Implementation from cite: 189-205] ...
+        pass # Replace with full implementation
+
+    def _validate_dom(self, dom_data, symbol):
+         # ... [Implementation from cite: 205-223, return dict report] ...
+        pass # Replace with full implementation
+
+
+    # --- Utility Methods ---
+    @lru_cache(maxsize=32) # Keep cache decorator
+    def get_timeframe_map(self):
+        # --- Keep implementation from Dataingestion (1).txt---
+        return self.timeframe_map.copy()
+
+    def clear_cache(self, symbol=None, timeframe=None):
+        # --- Keep implementation from Dataingestion (1).txt---
+        # ...
+        pass # Replace with full implementation
+
+
+    # --- Methods that likely belong elsewhere or need careful consideration ---
+    # These were in the original file but might fit better in other modules or need MT5 API passed differently
+
+    def synchronize_timeframes(self, symbol, base_timeframe='1min'):
+        """ Placeholder: Checks alignment but doesn't modify data directly """
+        # --- Keep implementation from Dataingestion (1).txt---
+        # Maybe this belongs in CentralTradingBot? Or just log warnings here.
+        # ...
+        self.logger.warning("synchronize_timeframes is placeholder/informational only.")
+        return {} # Return empty dict as it doesn't return processed data
+
+    def get_multi_timeframe_data(self, symbol):
+        """ Fetches data for multiple timeframes. """
+        # --- Keep implementation from Dataingestion (1).txt---
+        # This seems useful here.
+        # ...
+        pass # Replace with full implementation
+
+    def get_market_hours_status(self, symbol):
+        """ Check if market is open based on recent tick data. """
+        # --- Keep implementation from Dataingestion (1).txt---
+        # ...
+        pass # Replace with full implementation
+
+
+    def _get_frequency_string(self, timeframe):
+        # --- Keep implementation from Dataingestion (1).txt---
+        freq_map = {
+            '1min': 'T', '5min': '5T', '15min': '15T', '30min': '30T',
+            '1h': 'H', '4h': '4H', 'daily': 'D' # Use pandas freq strings
+        }
+        default_freq = 'T' # Default to 1 minute if unknown
+        freq = freq_map.get(timeframe, default_freq)
+        if timeframe not in freq_map:
+            self.logger.warning(f"Unknown timeframe '{timeframe}' in _get_frequency_string, using default '{default_freq}'.")
+        return freq
+
+
+    # --- NEW Placeholder Methods for Enhancements ---
+
+    def _perform_stationarity_tests(self, df: pd.DataFrame) -> Dict:
+        """Placeholder: Performs ADF and KPSS tests on the 'close' price."""
+        self.logger.debug("Performing stationarity tests (Placeholder)...")
+        results = {'adf_p_value': None, 'kpss_p_value': None, 'is_stationary_adf': None, 'is_stationary_kpss': None}
+        # --- Implementation Required ---
+        # Requires statsmodels library
+        # try:
+        #     if 'close' not in df or df['close'].isna().all(): raise ValueError("Close price missing or all NaN")
+        #     close_prices = df['close'].dropna()
+        #     if len(close_prices) < 20: raise ValueError("Not enough data points for stationarity test")
+        #
+        #     adf_result = adfuller(close_prices)
+        #     results['adf_p_value'] = adf_result[1]
+        #     results['is_stationary_adf'] = adf_result[1] < self.stationarity_p_value_threshold
+        #
+        #     # KPSS test requires careful handling of nlags parameter
+        #     kpss_result = kpss(close_prices, regression='c', nlags='auto')
+        #     results['kpss_p_value'] = kpss_result[1]
+        #     # Note: KPSS null hypothesis is stationarity, so p < threshold means NON-stationary
+        #     results['is_stationary_kpss'] = kpss_result[1] >= self.stationarity_p_value_threshold
+        # except ImportError:
+        #     self.logger.warning("statsmodels not installed, cannot perform stationarity tests.")
+        # except Exception as e_stat:
+        #     self.logger.error(f"Error during stationarity test: {e_stat}")
+        # ... implementation needed ...
+        return results
+
+    def _calculate_basic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Placeholder: Calculates basic features like returns."""
+        self.logger.debug("Calculating basic features (Placeholder)...")
+        df_out = df.copy()
+        # --- Implementation Required ---
+        # try:
+        #     df_out['log_return'] = np.log(df_out['close'] / df_out['close'].shift(1))
+        #     df_out['simple_return'] = df_out['close'].pct_change()
+        #     # Example: Basic volatility (annualized std dev of log returns)
+        #     # volatility_window = self.config_di.get('basic_vol_window', 20)
+        #     # bars_per_year = self.config_di.get('bars_per_year', 252) # Needs to be accurate for timeframe!
+        #     # df_out['volatility_basic'] = df_out['log_return'].rolling(window=volatility_window).std() * np.sqrt(bars_per_year)
+        # except Exception as e_feat:
+        #      self.logger.error(f"Error calculating basic features: {e_feat}")
+        # ... implementation needed ...
+        return df_out
+
+    # def _apply_pca_on_raw(self, df: pd.DataFrame, n_components: int = 3) -> pd.DataFrame:
+    #     """Placeholder: Applies PCA on raw OHLCV data (Example - Use with caution)."""
+    #     self.logger.debug("Applying PCA on raw data (Placeholder)...")
+    #     # --- Implementation Required ---
+    #     # Needs sklearn PCA and StandardScaler
+    #     # Select columns, handle NaNs, scale, fit PCA, transform, add back to df
+    #     # ... implementation needed ...
+    #     return df
+
+    # def _process_dom_metrics(self, dom_data: List[Dict]) -> Dict:
+    #     """Placeholder: Calculates metrics from raw DOM data."""
+    #     self.logger.debug("Processing DOM metrics (Placeholder)...")
+    #     # --- Implementation Required ---
+    #     # Calculate cumulative depth, imbalance ratio, largest levels etc.
+    #     metrics = {}
+    #     # ... implementation needed ...
+    #     return metrics
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass
