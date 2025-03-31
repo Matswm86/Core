@@ -1,0 +1,274 @@
+# ... (Imports: logging, time, datetime, pd, pytz, threading, signal, queue, os, json, traceback, typing) ...
+# Potentially add imports for: psutil, sqlite3
+
+# Import other module classes
+# from DataIngestion import DataIngestion
+# from SignalGenerator import SignalGenerator
+# ... etc ...
+
+class CentralTradingBot:
+    # --- __init__ ---
+    def __init__(self, config: Dict[str, Any]) -> None:
+        # ... [Existing init logic from cite: 1-8, including loading config, mode, logger] ...
+        # ... [Initialize modules_enabled, component_status] ...
+        self.logger.info(f"Initializing Central Trading Bot in {self.mode} mode")
+
+        # --- NEW: Event Queue is central ---
+        self.event_queue: queue.Queue = queue.Queue()
+        self.stop_event: threading.Event = threading.Event() # Used to signal stop
+
+        self.initialize_components() # Initialize all sub-modules
+
+        # ... [Initialize positions, cooldown, performance metrics, status callback cite: 6-8] ...
+
+        # --- NEW: Health Check parameters ---
+        self.last_health_check_time = None
+        self.health_check_interval = timedelta(seconds=config.get('central_trading_bot', {}).get('health_check_interval_sec', 60))
+
+        if self.mode == 'live':
+            self._setup_signal_handlers()
+
+        self.logger.info("Central Trading Bot initialized successfully")
+
+    # --- Component Initialization (Keep existing flexible logic) ---
+    # initialize_components, _create_stub, _init_mt5_api, _init_data_ingestion, _init_module, ...
+    # ...
+
+    # --- Start/Stop Logic (Refined) ---
+    def start(self) -> bool:
+        # ... [Existing state checks cite: 38-39] ...
+        if self.mode == 'live':
+            return self.start_live_trading()
+        else: # Backtest mode
+            # Favor external/dedicated backtester
+            if self.config.get('central_trading_bot', {}).get('use_backtrader', False) or \
+               self.config.get('central_trading_bot', {}).get('use_custom_backtester', True):
+                 return self.start_external_backtest()
+            else:
+                 # Fallback to basic integrated simulation (discouraged)
+                 self.logger.warning("Using basic integrated backtest simulation. Consider dedicated backtester.")
+                 return self._run_integrated_backtest() # Keep for compatibility if needed
+
+    def start_live_trading(self) -> bool:
+        # ... [Existing component checks cite: 39-42] ...
+        self.state = 'running'
+        self.start_time = datetime.now(pytz.UTC)
+        self.stop_event.clear()
+        # ... [Start API Server, News Monitor, Dashboard threads cite: 42-45] ...
+        self.logger.info(f"Live trading started...")
+
+        # --- Start the main event processing loop ---
+        self.main_thread = threading.Thread(target=self._event_processing_loop) # Renamed loop
+        self.main_thread.daemon = True
+        self.main_thread.start()
+        # --- Potentially start separate thread for data fetching/event generation ---
+        # self.data_thread = threading.Thread(target=self._data_fetch_loop)
+        # self.data_thread.start()
+        return True
+
+    def start_external_backtest(self) -> bool:
+        """ Initiates backtesting using a dedicated Backtesting module/framework. """
+        if self.mode != 'backtest': return False
+        self.logger.info("Starting backtesting using dedicated framework...")
+        self.state = 'running_backtest'
+        self.start_time = datetime.now(pytz.UTC)
+        results = None
+        try:
+            # Assuming a 'Backtesting' module/class exists and is configured
+            if hasattr(self, 'backtesting') and self.backtesting: # Check if Backtesting module was initialized
+                 results = self.backtesting.run() # Assume run() returns results dict
+            else:
+                 # Placeholder if using external tool like Backtrader configured elsewhere
+                 self.logger.info("Assuming external backtesting framework (e.g., Backtrader) is run separately.")
+                 # Or try to instantiate and run it if configured here
+                 # from Backtesting import Backtesting # Example
+                 # backtester = Backtesting(self.config, self) # Pass self if needed
+                 # results = backtester.run()
+                 results = {'summary': {'status': 'External backtest assumed complete'}, 'trades': [], 'equity_curve': []} # Dummy results
+
+            if results:
+                 self.logger.info("Backtesting run completed.")
+                 self.generate_report(results) # Generate report from results
+                 self.state = 'completed_backtest'
+                 return True
+            else:
+                 self.logger.error("Backtesting did not produce results.")
+                 self.state = 'error'
+                 return False
+
+        except Exception as e:
+            self.state = 'error'
+            self.logger.error(f"Error during dedicated backtesting: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return False
+
+
+    def stop(self) -> bool:
+        # ... [Existing state checks cite: 119] ...
+        self.logger.info("Stopping Central Trading Bot...")
+        self.shutdown_requested = True
+        self.stop_event.set() # Signal threads to stop
+
+        # Wait for main thread(s) to finish (add timeout)
+        if hasattr(self, 'main_thread') and self.main_thread.is_alive():
+            self.logger.info("Waiting for main loop to stop...")
+            self.main_thread.join(timeout=10.0) # Wait max 10 seconds
+        # if hasattr(self, 'data_thread') and self.data_thread.is_alive():
+        #     self.data_thread.join(timeout=5.0)
+
+        # ... [Stop API Server, News, Dashboard cite: 120-123] ...
+        # ... [Disconnect MT5 cite: 123-124] ...
+
+        # Final state save
+        self._save_state()
+
+        self.state = 'stopped'
+        self.logger.info("Central Trading Bot stopped")
+        return True
+
+    # --- Main Loop (Event-Driven Conceptual Outline) ---
+    def _event_processing_loop(self):
+        """ Main loop processing events from the queue. """
+        self.logger.info("Event processing loop started.")
+        while not self.stop_event.is_set():
+            try:
+                # Wait for event with timeout for periodic tasks
+                event = self.event_queue.get(block=True, timeout=1.0) # Timeout allows periodic checks
+                self._handle_event(event)
+                self.event_queue.task_done()
+            except queue.Empty:
+                # Timeout occurred, perform periodic tasks
+                self._perform_periodic_tasks()
+            except Exception as e:
+                self.logger.error(f"Error in event processing loop: {e}")
+                self.logger.debug(traceback.format_exc())
+                time.sleep(5) # Pause after error
+        self.logger.info("Event processing loop exiting.")
+
+    def _handle_event(self, event: Dict):
+        """Placeholder: Handles different event types from the queue."""
+        event_type = event.get('type')
+        self.logger.debug(f"Handling event: {event_type}")
+        # --- Implementation Required ---
+        # if event_type == 'TICK':
+        #     tick_data = event.get('data')
+        #     # Call SignalGenerator.process_tick, etc.
+        #     signal = self.signal_generator.process_tick(tick_data)
+        #     if signal: self.event_queue.put({'type': 'SIGNAL', 'data': signal}) # Put signal event back?
+        # elif event_type == 'BAR':
+        #     bar_data = event.get('data')
+        #     symbol = bar_data.get('symbol')
+        #     timeframe = bar_data.get('timeframe')
+        #     # Trigger analysis for this completed bar...
+        # elif event_type == 'SIGNAL':
+        #     signal_data = event.get('data')
+        #     # Process signal (check risk, execute)
+        #     self._process_signal_event(signal_data)
+        # elif event_type == 'FILL':
+        #     fill_data = event.get('data')
+        #     # Update Risk Management PnL, positions
+        #     self._handle_fill_event(fill_data)
+        # elif event_type == 'NEWS':
+        #     news_data = event.get('data')
+        #     # Potentially adjust risk or trigger analysis
+        #     self._handle_news_event(news_data)
+        # elif event_type == 'CONFIG_UPDATE':
+        #      self._load_dynamic_config()
+        # ... etc ...
+        pass
+
+    def _perform_periodic_tasks(self):
+        """Tasks performed periodically during event loop timeout."""
+        now = datetime.now(pytz.UTC)
+        # Check health
+        if self.last_health_check_time is None or (now - self.last_health_check_time) >= self.health_check_interval:
+             self._perform_health_checks()
+             self.last_health_check_time = now
+        # Check risk level expiry
+        if hasattr(self, 'risk_management') and self.risk_management:
+             self.risk_management.check_risk_level()
+        # Reconcile state?
+        # self._reconcile_all_states() # Maybe less frequent?
+        pass
+
+    # --- NEW Placeholders for Enhancements ---
+    def _handle_fill_event(self, fill_data: Dict):
+         """Placeholder: Processes order fill information."""
+         self.logger.info(f"Processing fill event: {fill_data.get('ticket')}")
+         # --- Implementation Required ---
+         # Needs to:
+         # 1. Identify the order/position based on ticket/ID.
+         # 2. Update position status (open, closed, partially filled).
+         # 3. Call RiskManagement.update_pnl if position closed.
+         # 4. Update self.current_positions.
+         # 5. Potentially trigger follow-up actions (e.g., update SL/TP).
+         # This logic depends heavily on how TradeExecution reports fills.
+         pass
+
+    def _handle_news_event(self, news_item: Dict):
+         """Placeholder: Processes news items."""
+         # Similar to _process_news_queue logic, but integrated into event loop
+         self.logger.info(f"Processing news event: {news_item.get('headline', 'N/A')}")
+         # --- Implementation Required ---
+         # Analyze impact (maybe via ML module?), potentially call RM.set_risk_level()
+         pass
+
+    def _perform_health_checks(self):
+        """Placeholder: Checks status of critical components."""
+        self.logger.debug("Performing health checks (Placeholder)...")
+        # --- Implementation Required ---
+        # Check MT5 connection: self.mt5_api.ping() or similar
+        # Check DataIngestion feed: self.data_ingestion.get_market_hours_status() -> check last_tick_time
+        # Check module statuses (if they provide health status)
+        # Trigger Notification if issues found.
+        pass
+
+    def _load_dynamic_config(self):
+        """Placeholder: Reloads configuration dynamically."""
+        # --- Implementation Required ---
+        self.logger.info("Reloading dynamic configuration (Placeholder)...")
+        # Needs logic to:
+        # 1. Read config from source (file, database, API).
+        # 2. Compare with current self.config.
+        # 3. Update relevant attributes (e.g., risk parameters, thresholds).
+        # 4. Propagate changes to sub-modules if necessary (they might need reload methods).
+        pass
+
+    def _reconcile_all_states(self):
+         """Placeholder: Compares internal state with broker state."""
+         self.logger.info("Reconciling broker state (Placeholder)...")
+         # --- Implementation Required ---
+         # Call TradeExecution._reconcile_broker_state() or implement logic here.
+         pass
+
+    # --- Keep/Refactor other methods ---
+    # _setup_signal_handlers, _signal_handler, _check_cooldown, _process_symbol,
+    # _process_signal, _get_recent_data, _update_positions, _process_news_queue (maybe remove if event based),
+    # _update_performance_metrics, get_status, stop, load_state, generate_report, reset
+    # Use logic fromas base, adapt for event-driven model if chosen.
+    # Remove _run_integrated_backtest, _simulate_trade_result if using dedicated backtester.
+
+    # Example: Keep get_status, update it
+    def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the bot and its components."""
+        # --- Based on, ensure it reflects current state ---
+        status = {
+            'state': self.state, 'mode': self.mode,
+            'uptime_seconds': (datetime.now(pytz.UTC) - self.start_time).total_seconds() if self.start_time else 0,
+            'performance': self.performance_metrics,
+            'component_status': self.component_status, # Report init status
+            'current_positions': self.current_positions,
+            # Add more live metrics if needed (e.g., from RM.get_status())
+        }
+        if hasattr(self, 'risk_management') and self.risk_management and hasattr(self.risk_management, 'get_status'):
+            status['risk_status'] = self.risk_management.get_status()
+
+        # Add last event time? Queue size?
+        status['event_queue_size'] = self.event_queue.qsize()
+        return status
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass

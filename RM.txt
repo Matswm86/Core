@@ -1,0 +1,335 @@
+# Necessary Imports (logging, datetime, pytz, json, os, traceback, numpy, scipy.stats potentially)
+# import numpy as np
+# from scipy.stats import norm # Example for VaR
+
+class RiskManagement:
+    # ... (__init__ from file 5, add new params for VaR/Kelly limits) ...
+    def __init__(self, config):
+        # ... [Existing init logic from cite: 1-12] ...
+        risk_config = self.config.get('risk_management', {})
+        # ... [Load existing params: max_drawdown, max_daily_loss, etc.] ...
+
+        # Add params for enhancements
+        self.max_portfolio_var_ratio = risk_config.get('max_portfolio_var_ratio', 0.05) # e.g., Max 5% 1-day VaR
+        self.var_confidence_level = risk_config.get('var_confidence_level', 0.99) # e.g., 99% VaR
+        self.use_kelly_sizing = risk_config.get('use_kelly_sizing', False)
+        self.kelly_fraction = risk_config.get('kelly_fraction', 0.5) # e.g., Half-Kelly
+        self.min_trades_for_kelly = risk_config.get('min_trades_for_kelly', 50) # Min history for win rate calc
+        self.dynamic_risk_enabled = risk_config.get('dynamic_risk_enabled', False)
+        self.correlation_update_interval = risk_config.get('correlation_update_interval', 86400) # Update daily
+
+        # State for new features
+        self.peak_equity = self.initial_balance # Initialize peak equity
+        self.rolling_win_rate = 0.5 # Initialize win rate
+        self.rolling_avg_win_loss_ratio = 1.0 # Initialize win/loss ratio
+        self.correlation_matrix = risk_config.get('correlation_matrix', {}) # Load initial matrix
+        self.last_correlation_update = None
+
+        # ... [Rest of existing init logic: load state, reset metrics] ...
+        # Update peak equity from loaded state if available
+        # self.peak_equity = state.get('peak_equity', self.current_balance) # Load peak equity
+
+    # ... (_validate_config, reset_daily_metrics, _save_daily_metrics) ...
+    # ... (_save_state needs to include peak_equity, rolling metrics, correlation matrix) ...
+    # ... (_load_state needs to load peak_equity, rolling metrics, correlation matrix) ...
+
+    def check_risk_limits(self, account_status):
+        """ Check if current risk exposure is within configured limits (Enhanced). """
+        try:
+            # ... [Existing checks for balance, equity] ...
+            balance = account_status.get('balance', self.current_balance)
+            equity = account_status.get('equity', balance)
+
+            # --- NEW: Rolling Drawdown Check ---
+            # Update peak equity *before* checking drawdown
+            self.peak_equity = max(self.peak_equity, equity)
+            rolling_drawdown = (self.peak_equity - equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+            if rolling_drawdown >= self.max_drawdown: # Use max_drawdown param for rolling DD
+                message = f"Max Rolling Drawdown breached: {rolling_drawdown:.2%} >= {self.max_drawdown:.2%}"
+                self.logger.warning(message)
+                return False, message
+
+            # --- Existing Daily Loss Check---
+            # ...
+
+            # --- Existing Max Trades / Consecutive Losses Checks---
+            # ...
+
+            # --- NEW: Portfolio VaR Check (Conceptual) ---
+            # portfolio_var, portfolio_cvar = self._calculate_portfolio_var_cvar()
+            # if portfolio_var is not None and portfolio_var / balance > self.max_portfolio_var_ratio:
+            #     message = f"Portfolio VaR limit breached: {portfolio_var/balance:.2%} >= {self.max_portfolio_var_ratio:.2%}"
+            #     self.logger.warning(message)
+            #     return False, message
+
+            # ... [Existing daily profit check] ...
+
+            return True, "Risk limits within acceptable range"
+
+        except Exception as e:
+            # ... [Existing error handling] ...
+            return False, f"Risk check error: {str(e)}"
+
+
+    def evaluate_signal(self, signal, current_date, account_status):
+        """ Evaluate signal, calculate position size (potentially using Kelly), apply adjustments. """
+        try:
+            # ... [Existing initial checks and metric resets - cite: 46-51] ...
+            risk_allowed, reason = self.check_risk_limits(account_status)
+            if not risk_allowed:
+                # ... [Existing rejection logic] ...
+                 return {'accepted': False, 'reason': f"Risk limits exceeded: {reason}"}
+
+
+            # ... [Existing signal parameter extraction - cite: 51-55] ...
+            symbol = signal.get('symbol')
+            # ... [Get symbol_spec, point, pip_value_per_lot, etc.] ...
+
+            # --- Dynamic Risk Per Trade ---
+            base_risk_pct = self.risk_per_trade
+            if self.dynamic_risk_enabled:
+                 # --- Implementation Required ---
+                 # Calculate dynamic factor based on regime, vol, score, performance etc.
+                 # dynamic_factor = self._calculate_dynamic_risk_factor(signal, structure_analysis, flow_analysis) # Needs inputs
+                 dynamic_factor = 1.0 # Placeholder
+                 current_risk_pct = base_risk_pct * dynamic_factor * self.check_risk_level()
+            else:
+                 current_risk_pct = base_risk_pct * self.check_risk_level() # Use only manual level adjust
+
+            # --- Calculate Stop Loss Distance (reuse existing logic/signal input) ---
+            # ... [Get/Calculate stop_loss and stop_loss_points - cite: 56-60] ...
+            stop_loss = signal.get('stop_loss')
+            # ... calculate stop_loss_points based on SL or ATR ...
+            if stop_loss is None: # Calculate if not provided
+                 # ... calculate SL based on ATR ...
+                 pass
+            stop_loss_points = abs(signal['entry_price'] - stop_loss) / point if stop_loss is not None else self.config.get('min_sl_points', 50)
+            stop_loss_points = max(stop_loss_points, self.config.get('min_sl_points', {}).get(symbol, 10)) # Ensure minimum
+
+
+            # --- Position Sizing ---
+            volume = 0
+            sizing_method = "Fixed Fractional"
+
+            if self.use_kelly_sizing and len(self.trade_history) >= self.min_trades_for_kelly:
+                 # --- Kelly Criterion Sizing ---
+                 # --- Implementation Required ---
+                 # kelly_fraction = self._calculate_kelly_fraction(symbol, signal) # Needs win rate, win/loss ratio
+                 # if kelly_fraction is not None:
+                 #     risk_amount_kelly = self.current_balance * kelly_fraction
+                 #     # Calculate volume based on Kelly amount and SL distance
+                 #     risk_per_pip = risk_amount_kelly / (stop_loss_points / 10) # Assuming point=0.00001, pip=0.0001
+                 #     volume_kelly = risk_per_pip / pip_value_per_lot
+                 #     volume = volume_kelly # Use Kelly volume
+                 #     sizing_method = f"Kelly (f={kelly_fraction:.3f})"
+                 pass # Placeholder
+
+            if volume == 0: # Fallback to Fixed Fractional if Kelly not used or failed
+                 # --- Fixed Fractional Sizing ---
+                 adjusted_risk_pct = current_risk_pct # Start with dynamic/level adjusted risk
+                 # Apply correlation factor
+                 correlation_factor = self._apply_correlation_adjustment(symbol)
+                 adjusted_risk_pct *= correlation_factor
+                 # Apply volatility adjustment
+                 volatility_adjustment = self._calculate_volatility_adjustment(signal) # Use GARCH if available?
+                 adjusted_risk_pct *= volatility_adjustment
+
+                 risk_amount = self.current_balance * adjusted_risk_pct
+                 risk_per_pip = risk_amount / (stop_loss_points / 10) if stop_loss_points > 0 else 0
+                 volume_fixed = risk_per_pip / pip_value_per_lot if pip_value_per_lot > 0 else 0
+                 volume = volume_fixed
+                 sizing_method = f"Fixed Fractional (Risk={adjusted_risk_pct:.3%})"
+
+
+            # ... [Existing volume normalization and max volume check - cite: 63-64] ...
+            volume = max(symbol_spec['min_lot'], round(volume / symbol_spec['lot_step']) * symbol_spec['lot_step'])
+            volume = min(volume, self.config.get('risk_management',{}).get('max_position_size', 10.0))
+
+            # --- Calculate TP (reuse existing logic/signal input) ---
+            take_profit = signal.get('take_profit')
+            if take_profit is None:
+                 # Calculate based on R:R and SL distance
+                 sl_distance = abs(signal['entry_price'] - stop_loss)
+                 rr_ratio = self.config.get('risk_management',{}).get('risk_reward_ratio', 1.5)
+                 take_profit = signal['entry_price'] + sl_distance * rr_ratio if signal['action'] == 'buy' else signal['entry_price'] - sl_distance * rr_ratio
+
+            # --- Create Adjusted Signal ---
+            adjusted_signal = signal.copy()
+            adjusted_signal.update({
+                'volume': volume, 'stop_loss': stop_loss, 'take_profit': take_profit,
+                'sizing_method': sizing_method,
+                # ... [Include other context like risk_amount, correlation_factor etc.] ...
+            })
+
+            # ... [Existing logging and return success - cite: 66-68] ...
+            return {'accepted': True, 'reason': 'Signal passed risk evaluation', 'adjusted_signal': adjusted_signal}
+
+        except Exception as e:
+            # ... [Existing error handling - cite: 68-69] ...
+             return {'accepted': False, 'reason': f"Error evaluating signal: {e}", 'original_signal': signal, 'error': str(e)}
+
+
+    def update_pnl(self, trade_result, exit_price):
+        """ Update P&L, balance, daily metrics, history, win rate etc. """
+        try:
+            # ... [Existing validation - cite: 86-91] ...
+            # ... [Existing P&L calculation incl comm/slip - cite: 91-94] ...
+            net_profit_loss = ...
+
+            # --- Update Rolling Metrics for Kelly/Dynamic Risk ---
+            # --- Implementation Required ---
+            # Append result (win/loss amount) to recent history
+            # Recalculate rolling_win_rate and rolling_avg_win_loss_ratio
+            # self._update_rolling_performance_metrics(net_profit_loss)
+
+            # --- Existing daily metric updates - cite: 94-98 ---
+            is_winning_trade = net_profit_loss > 0
+            # ... update daily_profit, daily_loss, win/loss counts, consecutive losses ...
+            # Update PEAK equity after updating balance
+            self.current_balance += net_profit_loss
+            self.peak_equity = max(self.peak_equity, self.current_balance) # Update peak equity
+
+            # ... [Existing position removal, trade record creation, logging - cite: 98-104] ...
+            # ... [Debounced save state] ...
+            return { ... } # Success result
+        except Exception as e:
+            # ... [Existing error handling - cite: 104-106] ...
+            return { ... } # Error result
+
+    # ... (track_position, set_risk_level, check_risk_level, get_status - keep originals from file 5) ...
+    # ... (get_symbol_specs, get_slippage_points - keep originals) ...
+
+    # --- Refined Helper Methods ---
+    def _calculate_volatility_adjustment(self, signal: Dict, garch_forecast: Optional[float] = None) -> float:
+        """ Calculate risk adjustment factor using GARCH if available, else ATR/Regime. """
+        # --- Implementation Required ---
+        # Needs logic similar tobut prioritizes garch_forecast if passed and valid.
+        # Scale risk down for high vol, potentially up slightly for low vol in trends.
+        adjustment = 1.0
+        vol_measure = None
+        source = "ATR"
+
+        if garch_forecast is not None and garch_forecast > 0:
+             # Need to normalize GARCH forecast (e.g., relative to its historical avg?)
+             # Simple example: Assume forecast is annualized %, compare to a baseline like 20%
+             # baseline_vol = 20.0
+             # vol_score = min(2.0, max(0.1, garch_forecast / baseline_vol)) # Ratio to baseline
+             # source = "GARCH"
+             pass # Placeholder for GARCH-based scaling
+
+        elif 'atr' in signal and 'avg_atr' in signal and signal['avg_atr'] > 0:
+             # Fallback to ATR logic from original code
+             atr = signal['atr']
+             avg_atr = signal['avg_atr']
+             volatility_ratio = atr / avg_atr
+             vol_score = min(1.0, max(0.0, (volatility_ratio - 0.7) / 1.3)) # Original 0-1 scale
+             source = "ATR Ratio"
+             # Apply regime logic from original code based on vol_score
+             # ...
+        else:
+             self.logger.warning("Could not determine volatility for adjustment.")
+             return 1.0 # Default if no vol info
+
+        # Example adjustment logic (replace with refined rules)
+        # adjustment = 1.0 - (vol_score * 0.5) # Reduce risk as vol_score increases
+        # adjustment = max(0.3, min(1.2, adjustment)) # Clamp
+        self.logger.debug(f"Volatility adjustment factor: {adjustment:.2f} (Source: {source})")
+        return adjustment # Placeholder value
+
+    def _apply_correlation_adjustment(self, new_symbol: str) -> float:
+        """ Calculates correlation factor based on open positions. """
+        # --- Implementation Required ---
+        # Needs updated correlation matrix potentially. Logic fromseems okay as a starting point.
+        # Consider using risk exposure ($ value at risk) instead of just volume.
+        # self._update_correlation_matrix_if_needed() # Add periodic update
+        exposure = self._calculate_correlated_exposure(new_symbol) # Uses existing logic
+        factor = max(0.1, 1.0 - (exposure / self.max_correlation_exposure)) if self.max_correlation_exposure > 0 else 1.0
+        if factor < 0.99: self.logger.info(f"Applying correlation adjustment factor: {factor:.2f}")
+        return factor
+
+    # --- NEW Placeholder Methods for Enhancements ---
+
+    def _calculate_portfolio_var_cvar(self) -> Tuple[Optional[float], Optional[float]]:
+        """Placeholder: Calculate portfolio VaR/CVaR based on history or positions."""
+        # --- Implementation Required ---
+        # Method 1: Historical Simulation on trade_history returns
+        # Method 2: Parametric VaR (Variance-Covariance) on current open positions (needs asset correlations, volatilities)
+        # Method 3: Monte Carlo on current positions
+        # Needs numpy, scipy.stats
+        self.logger.debug("Calculating Portfolio VaR/CVaR (Placeholder)...")
+        var_amount = None
+        cvar_amount = None
+        # ... implementation needed ...
+        return var_amount, cvar_amount
+
+    def _calculate_kelly_fraction(self, symbol: str, signal: Dict) -> Optional[float]:
+        """Placeholder: Calculate Kelly Criterion fraction."""
+        # --- Implementation Required ---
+        # Needs reliable win probability (W) and win/loss ratio (R) estimates.
+        # W could come from rolling_win_rate, or signal['probability'] if using ML.
+        # R could come from rolling_avg_win_loss_ratio.
+        # Formula: f* = W - (1 - W) / R
+        # Apply configured self.kelly_fraction (e.g., 0.5 for half-Kelly)
+        self.logger.debug("Calculating Kelly Fraction (Placeholder)...")
+        win_prob = self.rolling_win_rate # Use rolling average
+        win_loss_ratio = self.rolling_avg_win_loss_ratio
+        kelly_f = None
+        if win_loss_ratio > 0:
+            try:
+                f_star = win_prob - (1.0 - win_prob) / win_loss_ratio
+                kelly_f = max(0, min(1.0, f_star * self.kelly_fraction)) # Apply fraction and clamp 0-1
+            except Exception as e_kelly:
+                 self.logger.error(f"Error calculating Kelly fraction: {e_kelly}")
+        return kelly_f
+
+    def _update_rolling_performance_metrics(self, net_pnl: float):
+        """Placeholder: Update rolling win rate and win/loss ratio from trade history."""
+        # --- Implementation Required ---
+        # Needs access to self.trade_history (list of trade records)
+        # Define rolling window (e.g., last 100 trades)
+        # Calculate win rate and avg win / avg loss over the window
+        self.logger.debug("Updating rolling performance metrics (Placeholder)...")
+        # lookback = 100
+        # recent_trades = self.trade_history[-lookback:]
+        # if len(recent_trades) > 20: # Need enough trades
+        #    wins = [t['profit_loss'] for t in recent_trades if t['profit_loss'] > 0]
+        #    losses = [abs(t['profit_loss']) for t in recent_trades if t['profit_loss'] <= 0]
+        #    self.rolling_win_rate = len(wins) / len(recent_trades) if recent_trades else 0.5
+        #    avg_win = np.mean(wins) if wins else 0
+        #    avg_loss = np.mean(losses) if losses else 0.01 # Avoid division by zero
+        #    self.rolling_avg_win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 1.0
+        # ... implementation needed ...
+        pass
+
+    def _calculate_dynamic_risk_factor(self, signal: Dict, structure_analysis: Dict, flow_analysis: Dict) -> float:
+        """Placeholder: Calculate dynamic risk multiplier based on market conditions."""
+        # --- Implementation Required ---
+        # Combine inputs: regime, volatility, signal score/confidence, etc.
+        # Return a factor (e.g., 0.5 to 1.5) to multiply base risk_per_trade by.
+        self.logger.debug("Calculating dynamic risk factor (Placeholder)...")
+        factor = 1.0
+        # Example: factor *= 0.7 if regime == 'volatile'
+        # Example: factor *= (0.8 + 0.4 * signal['score']/10.0) # Scale with score
+        # ... implementation needed ...
+        return max(0.1, min(1.5, factor)) # Clamp factor
+
+    def _update_correlation_matrix_if_needed(self):
+        """Placeholder: Recalculates symbol correlation matrix periodically."""
+        # --- Implementation Required ---
+        # Needs access to historical data (e.g., daily returns for N days).
+        # Use pandas df.corr() on returns matrix.
+        # Update self.correlation_matrix cache.
+        now = datetime.now(pytz.UTC)
+        if self.last_correlation_update is None or (now - self.last_correlation_update).total_seconds() > self.correlation_update_interval:
+             self.logger.info("Updating correlation matrix (Placeholder)...")
+             # ... fetch historical returns ...
+             # ... calculate correlation: returns_df.corr() ...
+             # self.correlation_matrix = correlation_df.to_dict()
+             # self.last_correlation_update = now
+             pass
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass

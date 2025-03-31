@@ -1,0 +1,360 @@
+# Necessary Imports
+import pandas as pd
+import logging
+import MetaTrader5 as mt5
+from datetime import datetime, timedelta
+import pytz
+import time
+import uuid
+import random
+import numpy as np
+from typing import Dict, List, Optional, Any, Tuple # Added Tuple
+
+class TradeExecution:
+    """
+    Trade Execution module for handling order submission and management.
+    Handles market/pending orders, partial fills (basic handling), modifications, cancellations.
+    Includes dynamic parameter placeholders and reconciliation concepts.
+    """
+
+    def __init__(self, config, mt5_api):
+        """
+        Initialize TradeExecution with configuration settings.
+        """
+        self.config = config
+        self.config_te = config.get('trade_execution', {}) # TE specific config
+        self.mt5_api = mt5_api
+        self.logger = logging.getLogger(__name__)
+
+        # Trading settings from config
+        self.order_type = self.config_te.get('order_type', 'market') # Default order type if placing directly
+        self.max_retries = self.config_te.get('max_retries', 3)
+        self.retry_delay = self.config_te.get('retry_delay', 1.0)
+        # Static slippage/deviation as fallback
+        self.max_slippage_pips = self.config_te.get('max_slippage_pips', 2.0)
+        self.default_deviation = self.config_te.get('default_deviation', 10)
+        self.default_magic = self.config_te.get('default_magic', 123456)
+        self.order_comment = self.config_te.get('order_comment', "AlgoTrade")
+
+        # Params for dynamic adjustments (if enabled)
+        self.use_dynamic_params = self.config_te.get('use_dynamic_params', False)
+        self.dynamic_slippage_atr_factor = self.config_te.get('dynamic_slippage_atr_factor', 0.1)
+        self.dynamic_deviation_atr_factor = self.config_te.get('dynamic_deviation_atr_factor', 0.05) # Smaller factor for deviation
+
+        # Symbol specifications (keep existing structure, potentially update from MT5 more dynamically)
+        self.symbol_specs = { ... } #(Load from config or fetch dynamically)
+        self.default_specs = { ... } #
+
+        # Order templates (keep existing structure)
+        self.order_templates = {
+            'market_buy': {"action": mt5.TRADE_ACTION_DEAL, "type": mt5.ORDER_TYPE_BUY, ... },
+            'market_sell': {"action": mt5.TRADE_ACTION_DEAL, "type": mt5.ORDER_TYPE_SELL, ... },
+            'limit_buy': {"action": mt5.TRADE_ACTION_PENDING, "type": mt5.ORDER_TYPE_BUY_LIMIT, ... },
+            'limit_sell': {"action": mt5.TRADE_ACTION_PENDING, "type": mt5.ORDER_TYPE_SELL_LIMIT, ... }
+            # Add STOP order templates if needed
+        }
+        # Update magic/comment from config for all templates
+        for key in self.order_templates:
+            self.order_templates[key]['magic'] = self.default_magic
+            self.order_templates[key]['comment'] = self.order_comment
+
+
+        # Trading session hours (keep existing)
+        self.trading_hours = self.config_te.get('trading_hours', {}) # [cite: 10]
+
+        # Order history tracking (keep existing)
+        self.order_history = {} # Store results of successful order sends
+
+        self.logger.info("Trade Execution initialized")
+
+    def execute_trade(self, signal):
+        """
+        Execute a trade based on the validated & adjusted signal from Risk Management.
+        """
+        self.logger.debug(f"Received signal for execution: {signal}")
+        result = {'success': False, 'reason': 'Execution failed', 'original_signal': signal.copy(), 'trade_result': None}
+
+        # Assuming signal passed Risk Management evaluation already
+        # Basic validation here as a safeguard
+        if not self._validate_signal_basic(signal): # Use a simpler validation here
+            result['reason'] = "Invalid signal structure received by executor"
+            return result
+
+        symbol = signal['symbol']
+        action = signal['action'] # 'buy' or 'sell'
+        volume = signal['volume'] # Already calculated by RiskManagement
+        stop_loss = signal.get('stop_loss') # Already calculated by RiskManagement
+        take_profit = signal.get('take_profit') # Already calculated by RiskManagement
+
+        # --- Pre-Send Checks ---
+        if self.config.get('central_trading_bot', {}).get('mode') != 'live':
+            result['reason'] = "Cannot execute trade: Not in live mode"
+            return result # Don't log warning here, expected behavior
+        if not self.mt5_api or not self.mt5_api.is_initialized():
+             result['reason'] = "MT5 API not available or not initialized"
+             self.logger.error(result['reason'])
+             return result
+        if not self._check_trading_hours(symbol):
+            result['reason'] = f"Outside trading hours for {symbol}"
+            self.logger.warning(result['reason'])
+            return result
+
+        spread_pips = self._check_spread(symbol)
+        max_allowed_spread = self._get_max_allowed_spread(symbol, signal.get('atr')) # Pass ATR if available
+        if spread_pips is None:
+            self.logger.warning(f"Cannot determine spread for {symbol}, proceeding with caution.")
+        elif spread_pips > max_allowed_spread:
+            result['reason'] = f"Spread too high for {symbol}: {spread_pips:.1f} pips > allowed {max_allowed_spread:.1f}"
+            self.logger.warning(result['reason'])
+            return result
+
+        # --- Prepare Order ---
+        order_template = self.order_templates.get(f'market_{action.lower()}')
+        if not order_template:
+            result['reason'] = f"Invalid action: {action}"
+            self.logger.error(result['reason'])
+            return result
+
+        current_price = self._get_market_price(symbol, action)
+        if current_price is None:
+            result['reason'] = f"Cannot get current market price for {symbol}"
+            self.logger.error(result['reason'])
+            return result
+
+        deviation = self._get_dynamic_deviation(symbol, signal.get('atr')) if self.use_dynamic_params else self.default_deviation
+
+        order = order_template.copy()
+        order.update({
+            "symbol": symbol,
+            "volume": self._validate_volume(symbol, volume), # Final validation
+            "price": current_price, # Fill at market
+            "deviation": deviation,
+            "sl": self._validate_price(symbol, stop_loss) if stop_loss else 0.0,
+            "tp": self._validate_price(symbol, take_profit) if take_profit else 0.0,
+        })
+
+        # --- Execute with Retries ---
+        execution_start = datetime.now(pytz.UTC)
+        final_order_result = None
+        last_processed_status = 'unknown'
+
+        for attempt in range(self.max_retries):
+            self.logger.info(f"Attempt {attempt + 1}/{self.max_retries} sending order for {symbol}: {action} {order['volume']} lots")
+            if attempt > 0: # Update price on retry
+                current_price = self._get_market_price(symbol, action)
+                if current_price: order['price'] = current_price
+                else:
+                    self.logger.warning(f"Could not update price on retry {attempt+1}")
+                    time.sleep(self.retry_delay)
+                    continue
+
+            raw_result = self.mt5_api.order_send(order)
+            processed_result = self._process_order_result(raw_result, order)
+            last_processed_status = processed_result['status']
+
+            if processed_result['status'] == 'filled' or processed_result['status'] == 'partial':
+                final_order_result = processed_result['details'] # Standardized dict
+                self.logger.info(f"Order execution successful (Status: {last_processed_status}) for {symbol} on attempt {attempt+1}. Ticket: {final_order_result.get('ticket')}")
+                # Handle partial fill if needed
+                if processed_result['status'] == 'partial':
+                    self._handle_partial_fill(final_order_result, order)
+                break # Exit retry loop on success/partial
+
+            elif processed_result['status'] == 'rejected_retry':
+                self.logger.warning(f"Order attempt {attempt+1} rejected, retrying: {processed_result['reason']}")
+                if attempt < self.max_retries - 1:
+                     time.sleep(self.retry_delay)
+                continue # Go to next attempt
+
+            elif processed_result['status'] == 'rejected_final':
+                self.logger.error(f"Order failed permanently for {symbol}: {processed_result['reason']}")
+                result['reason'] = f"Order rejected by broker: {processed_result['reason']}"
+                return result # Exit loop and return failure
+
+            else: # Unknown status
+                self.logger.error(f"Unknown order result processing status: {last_processed_status}, Reason: {processed_result.get('reason')}")
+                if attempt < self.max_retries - 1:
+                     time.sleep(self.retry_delay)
+                continue
+
+        # After loop, check if successful
+        if final_order_result is None:
+            result['reason'] = f"Execution failed after {self.max_retries} attempts (Last Status: {last_processed_status})"
+            self.logger.error(result['reason'])
+            return result
+
+        # --- Success ---
+        execution_time_ms = (datetime.now(pytz.UTC) - execution_start).total_seconds() * 1000
+
+        # Construct trade result based on the potentially partial fill details
+        trade_result = {
+            "symbol": symbol, "action": action,
+            "position_size": final_order_result.get('volume', 0), # Actual filled volume
+            "volume": final_order_result.get('volume', 0), # Keep both for consistency
+            "entry_price": final_order_result.get('entry_price', current_price),
+            "stop_loss": stop_loss, "take_profit": take_profit,
+            "timestamp": datetime.now(pytz.UTC).isoformat(),
+            "ticket": final_order_result.get('ticket', 0),
+            "spread_pips": spread_pips,
+            "signal_score": signal.get('score', 0), # Score from original signal
+            "execution_time_ms": execution_time_ms,
+            "fill_status": last_processed_status # 'filled' or 'partial'
+        }
+
+        self._record_order(trade_result) # Record the executed/partially executed trade
+        result.update({
+            'success': True,
+            'reason': f'Trade executed successfully (Status: {last_processed_status})',
+            'trade_result': trade_result
+        })
+        return result
+
+    # --- Helper Methods ---
+
+    def _validate_signal_basic(self, signal):
+        """ Basic validation for signal structure passed to executor. """
+        if not isinstance(signal, dict): return False
+        required = ['symbol', 'action', 'volume', 'entry_price'] # Executor needs these
+        if not all(field in signal for field in required): return False
+        if signal['action'] not in ['buy', 'sell']: return False
+        if not isinstance(signal['volume'], (int, float)) or signal['volume'] <= 0: return False
+        return True
+
+    def _process_order_result(self, raw_result, order_request) -> Dict:
+        """ Placeholder: Processes raw MT5 order result, handles errors, partial fills. """
+        # --- Implementation Required ---
+        # Based on previous refined placeholder. Needs detailed MT5 retcode handling.
+        self.logger.debug(f"Processing order result: {raw_result}")
+        status = 'unknown'
+        reason = 'Processing error'
+        details = {} # ticket, entry_price, volume (filled)
+
+        if raw_result is None:
+            status = 'rejected_retry'; reason = 'API returned None'
+        elif hasattr(raw_result, 'retcode'):
+            retcode = raw_result.retcode
+            comment = getattr(raw_result, 'comment', '')
+            if retcode == mt5.TRADE_RETCODE_DONE:
+                status = 'filled' # Assume full fill unless volume indicates otherwise
+                reason = 'Order filled'
+                details = {'ticket': raw_result.order, 'entry_price': raw_result.price, 'volume': raw_result.volume}
+                # Check for partial fill if possible (compare raw_result.volume to order_request['volume'])
+                if raw_result.volume < order_request['volume']:
+                    status = 'partial'
+                    reason = f"Partially filled {raw_result.volume}/{order_request['volume']}"
+            elif retcode == mt5.TRADE_RETCODE_REQUOTE: status = 'rejected_retry'; reason = f'Requote ({comment})'
+            elif retcode in [mt5.TRADE_RETCODE_TIMEOUT, mt5.TRADE_RETCODE_CONNECTION]: status = 'rejected_retry'; reason = f'Network/Timeout ({retcode})'
+            elif retcode == mt5.TRADE_RETCODE_NO_MONEY: status = 'rejected_final'; reason = f'No Money ({retcode})'
+            elif retcode == mt5.TRADE_RETCODE_INVALID_VOLUME: status = 'rejected_final'; reason = f'Invalid Volume {order_request["volume"]}'
+            # Add more specific retcode checks...
+            else: status = 'rejected_retry'; reason = f'Broker Reject ({retcode}) - {comment}' # Default to retry?
+        else:
+             # Handle dict result from wrapper?
+             if isinstance(raw_result, dict) and 'ticket' in raw_result and 'volume' in raw_result:
+                  status = 'filled' # Assume filled from dict
+                  reason = 'Order filled (dict)'
+                  details = raw_result
+                  if details.get('volume', 0) < order_request['volume']: status = 'partial'
+             else:
+                  status = 'rejected_retry'; reason = f'Unexpected format: {type(raw_result)}'
+
+        return {'status': status, 'reason': reason, 'details': details}
+
+    def _handle_partial_fill(self, fill_details, original_order):
+        """ Placeholder: Logic to handle partially filled orders. """
+        # --- Implementation Required ---
+        filled_volume = fill_details.get('volume', 0)
+        remaining_volume = round(original_order['volume'] - filled_volume, 8) # Use rounding
+        ticket = fill_details.get('ticket')
+        self.logger.warning(f"Order {ticket} partially filled: {filled_volume}/{original_order['volume']}. Remainder: {remaining_volume}")
+        # Configurable strategy: 'cancel', 'resubmit', 'ignore'
+        strategy = self.config_te.get('partial_fill_strategy', 'ignore')
+        if strategy == 'cancel':
+             # Need a way to cancel the *remaining* part if the broker handles it that way,
+             # or just log that only part was filled if it was IOC/FOK equivalent.
+             self.logger.info(f"Partial fill strategy: Ignoring remaining {remaining_volume} for {ticket}")
+             pass # Or call a specific cancel function if needed/possible
+        elif strategy == 'resubmit':
+             # Create a new signal/order for the remaining volume? Complex.
+             self.logger.info(f"Partial fill strategy: Resubmission for remaining {remaining_volume} not implemented.")
+             pass
+        else: # Ignore
+             self.logger.info(f"Partial fill strategy: Accepting filled amount {filled_volume} for {ticket}")
+             pass
+
+    def _get_dynamic_deviation(self, symbol, atr):
+        """ Placeholder: Calculates dynamic deviation based on volatility. """
+        if not self.use_dynamic_params or atr is None or pd.isna(atr) or atr <= 0:
+            return self.default_deviation
+
+        try:
+            specs = self._get_symbol_specs(symbol)
+            point = specs.get('point', 0.00001)
+            if point <= 0: return self.default_deviation
+            # Calculate deviation in points based on fraction of ATR
+            deviation_points = int(atr * self.dynamic_deviation_atr_factor / point)
+            # Use max of default or calculated? Or just calculated? Using max for safety.
+            final_deviation = max(self.default_deviation, deviation_points)
+            # Add absolute min/max caps?
+            return final_deviation
+        except Exception as e:
+            self.logger.warning(f"Error calculating dynamic deviation: {e}")
+            return self.default_deviation
+
+    def _get_dynamic_slippage(self, symbol, atr):
+        """ Placeholder: Calculates dynamic max allowed slippage pips based on volatility. """
+        if not self.use_dynamic_params or atr is None or pd.isna(atr) or atr <= 0:
+            return self.max_slippage_pips
+
+        try:
+            specs = self._get_symbol_specs(symbol)
+            point = specs.get('point', 0.00001)
+            if point <= 0: return self.max_slippage_pips
+            pip_multiplier = 10 if specs.get('digits', 5) in [5, 3] else 1 # Rough guess
+            # Calculate slippage in pips based on fraction of ATR
+            slippage_pips = atr * pip_multiplier * self.dynamic_slippage_atr_factor
+            # Use max of default or calculated? Or just calculated? Using max for safety.
+            final_slippage = max(self.max_slippage_pips, slippage_pips)
+            # Add absolute min/max caps?
+            return final_slippage
+        except Exception as e:
+            self.logger.warning(f"Error calculating dynamic slippage: {e}")
+            return self.max_slippage_pips
+
+
+    def _get_max_allowed_spread(self, symbol, atr=None):
+        """ Get max allowed spread, potentially using dynamic slippage calculation. """
+        # Use dynamic slippage as the max spread allowed if enabled
+        if self.use_dynamic_params and atr:
+            return self._get_dynamic_slippage(symbol, atr)
+        else:
+            # Fallback to static config or simple calculation if needed
+            # Original logic used ATR * multiplier, let's keep dynamic separate
+             typical_spread = self.config_te.get('typical_spreads', {}).get(symbol, 3.0) # Configurable typical spread
+             return typical_spread * self.max_spread_multiplier
+
+
+    def _reconcile_broker_state(self):
+        """ Placeholder: Periodically compare internal position tracking with broker. """
+        # --- Implementation Required ---
+        self.logger.info("Running broker state reconciliation (Placeholder)...")
+        # Needs access to RiskManagement's position tracking AND mt5_api.positions_get()
+        # Compare lists, log discrepancies, potentially raise alerts via Notification module.
+        pass
+
+    # --- Include ALL other existing methods from Tradeexecution (1).txt ---
+    # Make sure to include: _validate_config, _get_symbol_specs, _get_market_price,
+    # _check_spread, _validate_volume, _validate_price, _get_deviation,
+    # _check_trading_hours, _record_order, get_account_status, close_position,
+    # modify_position, execute_backtest_trades, _simulate_trade_outcome, _random_outcome,
+    # get_order_history, get_pending_orders, _order_type_to_string, cancel_order,
+    # place_limit_order, get_closed_positions)
+    # Use the implementations fromfor these.
+
+    # --- [Paste the implementations for the above methods here from] ---
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass
