@@ -1,0 +1,371 @@
+# Necessary Imports (ensure all are installed)
+import pandas as pd
+import numpy as np
+import logging
+import pytz
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple
+from scipy.signal import find_peaks, argrelextrema # Added argrelextrema back if needed for basic swings
+from sklearn.cluster import DBSCAN
+# from sklearn.decomposition import PCA # Example if using PCA
+# from sklearn.linear_model import LinearRegression, LogisticRegression # Example if using Regression
+from hurst import compute_Hc
+import ta # Ensure ta is imported fully if needed beyond trend
+import ta.trend as trend
+import traceback
+# from statsmodels.tsa.stattools import adfuller, kpss # Example for Stationarity
+# from statsmodels.tsa.arima.model import ARIMA # Example for ARIMA
+# import joblib # Example: if loading ML models
+# import networkx as nx # Example if using graph concepts internally (unlikely here)
+
+class MarketStructure:
+    """
+    Market Structure analysis module for technical price action analysis.
+    Incorporates price patterns (Fibonacci, Harmonics), market regimes, cycles (FFT),
+    Wyckoff phases, Supply/Demand zones, statistical properties (Hurst, Stationarity),
+    potential predictive models (ARIMA, Regression), and dimensionality reduction (PCA).
+    Provides analysis results to SignalGenerator.
+    """
+
+    def __init__(self, config: Dict, parent):
+        """
+        Initialize the MarketStructure module.
+        """
+        self.parent = parent
+        self.config_full = config
+        self.config = config.get('market_structure', {})
+        self.logger = logging.getLogger(__name__)
+
+        # --- Symbol and Timeframe Initialization ---
+        # (Same logic as previous version)
+        if hasattr(parent, 'symbols'):
+            self.symbols = parent.symbols
+        # ... [rest of symbol/timeframe init] ...
+        else: # Fallback if parent doesn't have attributes
+            main_symbols = self.config_full.get('symbols', [])
+            central_config = self.config_full.get('central_trading_bot', {})
+            backtest_mode = central_config.get('mode') == 'backtest'
+            backtest_symbols = self.config_full.get('backtesting', {}).get('symbols', [])
+            if backtest_mode and backtest_symbols:
+                self.symbols = list(set(main_symbols + backtest_symbols))
+            else:
+                self.symbols = main_symbols
+
+        if hasattr(parent, 'timeframes'):
+            self.timeframes = parent.timeframes
+        else:
+            signal_gen_config = self.config_full.get('signal_generation', {})
+            self.timeframes = signal_gen_config.get('timeframes', [])
+
+        # --- Configuration Parameters ---
+        # Existing Base Params
+        self.hurst_update_interval = self.config.get('hurst_update_interval', 300)
+        self.hurst_mtf_update_interval = self.config.get('hurst_mtf_update_interval', 600)
+        self.hurst_min_window = self.config.get('hurst_min_window', 100)
+        self.hurst_trend_threshold = self.config.get('hurst_trend_threshold', 0.55)
+        self.hurst_mean_reversion_threshold = self.config.get('hurst_mean_reversion_threshold', 0.45)
+        self.alligator_jaw_period = self.config.get('alligator_jaw_period', 13) # ... etc for alligator ...
+        self.alligator_jaw_shift = self.config.get('alligator_jaw_shift', 8)
+        self.alligator_teeth_period = self.config.get('alligator_teeth_period', 8)
+        self.alligator_teeth_shift = self.config.get('alligator_teeth_shift', 5)
+        self.alligator_lips_period = self.config.get('alligator_lips_period', 5)
+        self.alligator_lips_shift = self.config.get('alligator_lips_shift', 3)
+
+        # S/D and Pivot Parameters
+        self.sd_zone_lookback = self.config.get('sd_zone_lookback', 250)
+        self.sd_pivot_distance = self.config.get('sd_pivot_distance', 5)
+        self.sd_pivot_prominence_atr_factor = self.config.get('sd_pivot_prominence_atr_factor', 0.5)
+        self.sd_zone_cluster_eps_atr_factor = self.config.get('sd_zone_cluster_eps_atr_factor', 0.3)
+        self.sd_zone_min_samples = self.config.get('sd_zone_min_samples', 2)
+        self.sd_zone_touch_threshold = self.config.get('sd_zone_touch_threshold', 0.2)
+        self.sd_zone_invalidation_atr_factor = self.config.get('sd_zone_invalidation_atr_factor', 0.5)
+
+        # Wyckoff Parameters
+        self.wyckoff_volume_avg_period = self.config.get('wyckoff_volume_avg_period', 50)
+        self.wyckoff_vol_spike_factor = self.config.get('wyckoff_vol_spike_factor', 2.5)
+        # ... other wyckoff params ...
+        self.wyckoff_update_interval = self.config.get('wyckoff_update_interval', 60)
+        self.wyckoff_phase_conf_threshold = self.config.get('wyckoff_phase_conf_threshold', 7.0)
+
+        # Parameters for New Placeholders
+        self.fft_dominant_cycle_threshold = self.config.get('fft_dominant_cycle_threshold', 0.1) # Min power for FFT cycle
+        self.stationarity_p_value_threshold = self.config.get('stationarity_p_value_threshold', 0.05)
+        self.arima_order = self.config.get('arima_order', (5, 1, 0)) # Default p,d,q for ARIMA
+        self.harmonic_tolerance = self.config.get('harmonic_tolerance', 0.05) # Tolerance for Fibonacci ratios
+
+        # Structure Weights (Needs careful definition based on included factors)
+        self.structure_weights = self.config.get('structure_weights', {
+            'trend_strength': 2, 'hurst_exponent': 1, 'price_patterns': 0, # Replaced
+            'support_resistance': 0, # Replaced
+            'multi_timeframe': 3, 'market_regime': 1, 'fractals': 0, # Less important now?
+            'wyckoff_phase_conf': 4, 'sd_zone_conf': 3,
+            'cycle_clarity': 1, # New weight example for FFT
+            'fib_level_conf': 1, # New weight example for Fibonacci
+            'harmonic_conf': 1, # New weight example for Harmonics
+            # Add weights for ARIMA/Regression prediction confidence?
+        })
+
+        # Stop Loss / Take Profit parameters (used in placeholders)
+        self.stop_loss_atr_multiplier = self.config.get('stop_loss_atr_multiplier', 2.0)
+        self.risk_reward_ratio = self.config.get('risk_reward_ratio', 1.5)
+
+        # --- Caches ---
+        # (Keep relevant caches from previous versions: Hurst, Alligator, Regime, S/D, Wyckoff)
+        self.hurst_cache = {s: {tf: {} for tf in self.timeframes} for s in self.symbols}
+        self.hurst_last_update = {s: {tf: None for tf in self.timeframes} for s in self.symbols}
+        # ... [rest of caches as defined before] ...
+        self.sd_zones_cache = {s: {tf: {'supply': [], 'demand': [], 'last_update': None} for tf in self.timeframes} for s in self.symbols}
+        self.wyckoff_state_cache = {s: {tf: {'phase': 'undefined', 'last_event': None, 'score': 0, 'details': {}} for tf in self.timeframes} for s in self.symbols}
+        self.wyckoff_last_update = {s: {tf: None for tf in self.timeframes} for s in self.symbols}
+        # Add caches for new, potentially expensive calculations if needed
+        self.fft_cache = {s: {tf: {} for tf in self.timeframes} for s in self.symbols}
+        self.arima_cache = {s: {tf: {} for tf in self.timeframes} for s in self.symbols}
+
+
+        # --- Load ML Models (Optional - If using ML for phases, regression etc.) ---
+        # (Same placeholder as before)
+        # self.wyckoff_phase_classifier = None
+        # ... [load models if configured] ...
+
+        self.logger.info("MarketStructure module initialized (Comprehensive Structure)")
+
+    # --- Core Analysis Method ---
+    def analyze(self, symbol: str, timeframe: str, df: pd.DataFrame, current_time: datetime) -> Dict[str, Any]:
+        """
+        Perform comprehensive market structure analysis including Wyckoff, S/D, Cycles, Patterns etc.
+        """
+        try:
+            required_bars = max(self.hurst_min_window, self.sd_zone_lookback, 50) # Adjust as needed
+            if df.empty or len(df) < required_bars:
+                return {'valid': False, 'reason': f'Insufficient data ({len(df)} bars, needed {required_bars})'}
+
+            df_analysis = df.copy()
+
+            # --- Ensure Base Indicators ---
+            # (Same logic as previous version to ensure ATR, Volume etc.)
+            if 'atr' not in df_analysis.columns or df_analysis['atr'].iloc[-required_bars:].isna().any():
+                 # Calculate ATR...
+                 pass # (Add ATR calculation logic)
+                 if 'atr' not in df_analysis.columns or df_analysis['atr'].iloc[-1] <= 0:
+                      return {'valid': False, 'reason': 'ATR indicator missing or invalid'}
+
+            has_volume = 'volume' in df_analysis and df_analysis['volume'].iloc[-required_bars:].sum() > 0
+
+            # --- Perform Core Analyses ---
+            # (These form the basis for many other calculations)
+            alligator_data = self.calculate_alligator_mas(symbol, timeframe, df_analysis, current_time)
+            alligator_state = self.detect_alligator_state(symbol, timeframe, alligator_data, df_analysis)
+            trend_analysis = self.analyze_trend(symbol, timeframe, df_analysis, alligator_data)
+            hurst_data = self.calculate_hurst_exponent(symbol, timeframe, df_analysis)
+            self._update_market_regime(symbol, timeframe, df_analysis, current_time)
+            regime = self.detect_market_regime(symbol, timeframe, df_analysis)
+
+            # --- Perform S/D and Wyckoff Analyses ---
+            sd_analysis = self._update_and_analyze_sd_zones(symbol, timeframe, df_analysis)
+            wyckoff_analysis = self._update_and_analyze_wyckoff(symbol, timeframe, df_analysis, sd_analysis, hurst_data, trend_analysis)
+
+            # --- Perform Additional Analyses (Now Added Structurally) ---
+            stationarity_result = self._check_stationarity(df_analysis['close']) # Example on close price
+            fft_cycles = self._analyze_market_cycles_fft(df_analysis['close']) # Example on close price
+            fib_levels = self._detect_fibonacci_levels(df_analysis)
+            harmonic_patterns = self._detect_harmonic_patterns(df_analysis)
+            # ARIMA / Regression / PCA would likely run here or be triggered based on conditions
+            # arima_forecast = self._forecast_arima_price_path(df_analysis['close'])
+            # regression_pred = self._predict_structure_regression(df_analysis, ...) # Needs features
+            # pca_factors = self._calculate_pca_structure_factors(df_analysis, ...) # Needs features
+
+            # --- Determine Final State ---
+            final_direction = self._determine_final_direction(trend_analysis, wyckoff_analysis, fft_cycles) # Example: Add cycle influence
+            final_strength = self._calculate_final_strength(trend_analysis, wyckoff_analysis, hurst_data, sd_analysis, fib_levels, harmonic_patterns) # Example: Use more factors
+
+            # --- Calculate Final Score ---
+            structure_score = self.calculate_structure_score(
+                 # Pass all relevant analysis results as kwargs
+                 symbol=symbol, timeframe=timeframe, regime=regime,
+                 final_direction=final_direction, final_strength=final_strength,
+                 hurst_data=hurst_data, wyckoff_analysis=wyckoff_analysis, sd_analysis=sd_analysis,
+                 alligator_state=alligator_state, fft_cycles=fft_cycles, fib_levels=fib_levels,
+                 harmonic_patterns=harmonic_patterns, # ... etc
+            )
+
+            # --- Construct Output Dictionary for SignalGenerator ---
+            result = {
+                'valid': True,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'timestamp': df_analysis.index[-1].isoformat(),
+
+                # Primary Outputs
+                'direction': final_direction,
+                'strength': final_strength,
+                'structure_score': structure_score,
+
+                # Key Contextual Info
+                'regime': regime,
+                'hurst_interpretation': hurst_data.get('interpretation'),
+                'wyckoff_phase': wyckoff_analysis.get('phase', 'undefined'),
+                'wyckoff_confidence': wyckoff_analysis.get('score', 0),
+                'wyckoff_last_event': wyckoff_analysis.get('last_event'),
+                'price_in_demand_zone': sd_analysis.get('in_demand', False),
+                'price_in_supply_zone': sd_analysis.get('in_supply', False),
+                'nearest_demand': sd_analysis.get('nearest_demand'),
+                'nearest_supply': sd_analysis.get('nearest_supply'),
+
+                # Additional Analysis Results (Include as needed by SignalGenerator or for logging)
+                'dominant_cycle_period': fft_cycles.get('dominant_period'),
+                'is_stationary': stationarity_result.get('is_stationary'),
+                'active_fib_level': fib_levels.get('active_level'),
+                'active_harmonic': harmonic_patterns.get('active_pattern'),
+                # 'arima_forecast': arima_forecast,
+                # ... add other outputs ...
+
+                'analysis_time': datetime.now(pytz.UTC).isoformat()
+            }
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Critical Error in MarketStructure analyze for {symbol} on {timeframe}: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return {'valid': False, 'reason': f'Error in analyze: {str(e)}'}
+
+    # --- Wyckoff Methods Placeholders ---
+    # (Keep _update_and_analyze_wyckoff, _analyze_wyckoff_events, _classify_wyckoff_phase, _calculate_wyckoff_score placeholders)
+    # ...
+
+    # --- Supply/Demand Methods Placeholders (Using Improved find_peaks/clustering approach) ---
+    # (Keep _update_and_analyze_sd_zones, _detect_significant_pivots_find_peaks, _define_zones_by_clustering, _refine_zones, _check_zone_interaction placeholders)
+    # ...
+
+    # --- NEW Placeholders for Additional Methods ---
+
+    def _check_stationarity(self, price_series: pd.Series) -> Dict:
+        """Placeholder: Performs stationarity tests (e.g., ADF, KPSS) on a price series."""
+        self.logger.debug("Checking stationarity (Placeholder)...")
+        # --- Implementation Required ---
+        # Needs statsmodels library
+        # Perform ADF test: from statsmodels.tsa.stattools import adfuller
+        #   result = adfuller(price_series.dropna())
+        #   p_value_adf = result[1]
+        # Perform KPSS test: from statsmodels.tsa.stattools import kpss
+        #   result = kpss(price_series.dropna(), regression='c') # 'c' for constant, 'ct' for constant+trend
+        #   p_value_kpss = result[1]
+        # Interpret p-values against self.stationarity_p_value_threshold
+        # ADF Null = Non-stationary; KPSS Null = Stationary
+        is_stationary = False # Example default
+        p_adf = np.nan
+        p_kpss = np.nan
+        # ... implementation needed ...
+        return {'is_stationary': is_stationary, 'adf_p_value': p_adf, 'kpss_p_value': p_kpss}
+
+    def _analyze_market_cycles_fft(self, price_series: pd.Series) -> Dict:
+        """Placeholder: Uses FFT to identify dominant cycle periods in price."""
+        self.logger.debug("Analyzing market cycles with FFT (Placeholder)...")
+        # --- Implementation Required ---
+        # Needs numpy.fft
+        # 1. Detrend the price series (e.g., use differences or subtract moving average)
+        # 2. Apply FFT: fft_result = np.fft.fft(detrended_series)
+        # 3. Calculate Power Spectrum: power = np.abs(fft_result)**2
+        # 4. Calculate Frequencies: freqs = np.fft.fftfreq(len(detrended_series))
+        # 5. Find dominant frequency/period (excluding zero frequency): find index of max power in power[1:]
+        # 6. Convert frequency to period (in bars): period = 1 / dominant_freq
+        # 7. Filter based on power threshold (self.fft_dominant_cycle_threshold)
+        dominant_period = None
+        power = 0.0
+        # ... implementation needed ...
+        return {'dominant_period': dominant_period, 'power': power}
+
+    def _detect_fibonacci_levels(self, df: pd.DataFrame) -> Dict:
+        """Placeholder: Detects key Fibonacci retracement/extension levels based on recent major swing."""
+        self.logger.debug("Detecting Fibonacci levels (Placeholder)...")
+        # --- Implementation Required ---
+        # 1. Identify a significant recent swing high and low (e.g., using find_peaks over a longer lookback).
+        # 2. Calculate key Fibonacci ratios (0.236, 0.382, 0.5, 0.618, 0.786) of that swing range.
+        # 3. Calculate retracement levels (low + ratio * range for uptrend, high - ratio * range for downtrend).
+        # 4. Check if current price is near any of these levels (within tolerance).
+        # 5. Potentially calculate extension levels as well.
+        active_level = None # e.g., 0.618
+        level_price = np.nan
+        swing_start_idx = None
+        swing_end_idx = None
+        # ... implementation needed ...
+        return {'active_level': active_level, 'level_price': level_price, 'swing_start': swing_start_idx, 'swing_end': swing_end_idx}
+
+    def _detect_harmonic_patterns(self, df: pd.DataFrame) -> Dict:
+        """Placeholder: Detects common harmonic patterns (Gartley, Bat, etc.)."""
+        self.logger.debug("Detecting harmonic patterns (Placeholder)...")
+        # --- Implementation Required ---
+        # This is complex. Requires:
+        # 1. Robust swing point detection (ZigZag indicator logic or similar).
+        # 2. Identifying sequences of 5 swing points (X, A, B, C, D).
+        # 3. Calculating Fibonacci ratios between the legs (XA, AB, BC, CD, AD).
+        # 4. Checking if these ratios match the specific rules for known patterns (Gartley, Bat, Butterfly, Crab, Cypher) within tolerance (self.harmonic_tolerance).
+        active_pattern = None # e.g., 'Bullish Gartley'
+        completion_price = np.nan # Price at point D
+        # ... implementation needed ...
+        return {'active_pattern': active_pattern, 'completion_price': completion_price}
+
+    def _forecast_arima_price_path(self, price_series: pd.Series) -> Optional[pd.Series]:
+        """Placeholder: Fits an ARIMA model and forecasts next N steps."""
+        self.logger.debug("Forecasting ARIMA path (Placeholder)...")
+        # --- Implementation Required ---
+        # Needs statsmodels.tsa.arima.model.ARIMA
+        # Consider caching the fitted model and updating periodically.
+        # 1. Determine ARIMA order (p,d,q) - potentially using auto_arima or based on config (self.arima_order).
+        # 2. Fit model: model = ARIMA(price_series, order=self.arima_order).fit()
+        # 3. Forecast: forecast = model.predict(start=len(price_series), end=len(price_series) + N - 1) # Forecast N steps ahead
+        # Handle potential errors (e.g., non-stationarity if d=0, convergence issues).
+        forecast_series = None
+        # ... implementation needed ...
+        return forecast_series
+
+    def _predict_structure_regression(self, df: pd.DataFrame, features: List[str]) -> Dict:
+        """Placeholder: Uses a pre-trained regression model to predict a structural outcome."""
+        self.logger.debug("Predicting structure with Regression (Placeholder)...")
+        # --- Implementation Required ---
+        # Needs scikit-learn or similar and a pre-trained model loaded in __init__
+        # 1. Ensure all 'features' are calculated and present in df.
+        # 2. Extract latest feature values.
+        # 3. Scale features using pre-fitted scaler.
+        # 4. Predict using loaded model (e.g., self.structure_model.predict(scaled_features)).
+        # 5. Return prediction (e.g., predicted price target, probability of phase continuation).
+        prediction = None
+        probability = np.nan
+        # ... implementation needed ...
+        return {'prediction': prediction, 'probability': probability}
+
+    def _calculate_pca_structure_factors(self, df: pd.DataFrame, features: List[str], n_components: int = 3) -> Optional[pd.DataFrame]:
+        """Placeholder: Applies PCA to reduce dimensionality of structural features."""
+        self.logger.debug("Calculating PCA factors (Placeholder)...")
+        # --- Implementation Required ---
+        # Needs sklearn.decomposition.PCA
+        # 1. Ensure all 'features' are calculated and present, handle NaNs.
+        # 2. Scale features.
+        # 3. Fit PCA model: pca = PCA(n_components=n_components).fit(scaled_features)
+        # 4. Transform features: factors = pca.transform(scaled_features)
+        # 5. Return the latest factor values (potentially as a Series or DataFrame).
+        # Consider caching the fitted PCA object.
+        pca_factors = None
+        # ... implementation needed ...
+        return pca_factors
+
+
+    # --- Include ALL other existing/placeholder methods from the previous version ---
+    # Make sure implementations for: calculate_alligator_mas, detect_alligator_state,
+    # analyze_trend, _update_market_regime, detect_market_regime,
+    # calculate_fractal_dimension, analyze_multi_timeframe_hurst, filter_signals_by_hurst,
+    # get_optimal_stop_loss, get_optimal_take_profit, calculate_vwap_and_bands,
+    # detect_price_patterns, detect_williams_fractals, detect_support_resistance,
+    # check_structure_break, calculate_optimal_levels, calculate_structure_score,
+    # _determine_final_direction, _calculate_final_strength, _get_timeframe_hierarchy
+    # are present below, using the best versions we developed.
+
+    # --- [Paste the implementations for the above methods here from previous responses] ---
+    # --- [ Ensure calculate_structure_score uses the new factors ] ---
+
+
+# --- Main execution block for testing (Example - needs real data loading) ---
+# if __name__ == '__main__':
+#    # ... (Setup logging, config, mock parent, load data) ...
+#    # ... (Instantiate MarketStructure) ...
+#    # ... (Call analyze and print results) ...
+#    pass # Placeholder for testing block

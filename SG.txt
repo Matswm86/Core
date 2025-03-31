@@ -1,0 +1,497 @@
+# Necessary Imports
+import pandas as pd
+from collections import deque
+from datetime import datetime, timedelta
+import pytz
+import logging
+import MetaTrader5 as mt5 # Keep if using MT5 API directly here
+import numpy as np
+# Remove specific ta imports if calculations moved to sub-modules
+# import ta.volatility as volatility
+# import ta.momentum as momentum
+from typing import Dict, Optional, List, Any
+import traceback
+import uuid
+# import joblib # If loading ML models
+# import networkx as nx # If using Graph analysis
+
+# Import specialized modules (ensure paths are correct)
+from MarketStructure import MarketStructure
+from OrderFlow import OrderFlow
+# Potentially import ML models or Risk Management interfaces if needed
+# from TrainedModels import SignalPredictor
+# from RiskManager import RiskManagerInterface
+
+class SignalGenerator:
+    """
+    Signal Generator module. Integrates Market Structure and Order Flow analysis,
+    potentially uses ML prediction or graph confluence, applies dynamic thresholds,
+    and constructs final trade signals with refined risk parameters.
+    """
+
+    def __init__(self, config: Dict, mt5_api=None):
+        """
+        Initialize the SignalGenerator.
+        """
+        self.config = config
+        self.config_sg = config.get('signal_generation', {}) # SG specific config
+        self._validate_config() # Use existing validation
+
+        # Core parameters
+        self.trading_timeframes = self.config_sg.get('trading_timeframes', ['15min'])
+        self.thresholds = self.config_sg.get('thresholds', {}) # Thresholds might become dynamic or ML probabilities
+        self.timeframes = self.config_sg.get('timeframes', ['5min', '15min', '1h', '4h', 'daily']) # All TFs needed for analysis
+        self.max_bars = self.config_sg.get('max_bars', {}) # Max bars per TF
+
+        # Symbol handling (same as before)
+        main_symbols = self.config.get('symbols', [])
+        backtest_mode = self.config.get('central_trading_bot', {}).get('mode') == 'backtest'
+        backtest_symbols = self.config.get('backtesting', {}).get('symbols', [])
+        if backtest_mode and backtest_symbols:
+            self.symbols = list(set(main_symbols + backtest_symbols))
+        else:
+            self.symbols = main_symbols
+
+        self.mt5_api = mt5_api # Keep if needed for direct interaction
+        self.logger = logging.getLogger(__name__)
+
+        # Data Structures (mostly same as before)
+        # Calculate max lookback needed across all modules/indicators
+        max_lookback_needed = 500 # Example: Determine programmatically from configs
+        self.histories = {s: {tf: deque(maxlen=max_lookback_needed) for tf in self.timeframes} for s in self.symbols}
+        # Indicator_histories might be less used here if MS/OF handle internal calcs
+        self.indicator_histories = {s: {tf: pd.DataFrame() for tf in self.timeframes} for s in self.symbols}
+        self.current_bars = {s: {tf: None for tf in self.timeframes} for s in self.symbols}
+        self.last_signals = {s: {tf: None for tf in self.trading_timeframes} for s in self.symbols}
+        self.real_time_data = {s: self._initialize_real_time_data() for s in self.symbols}
+
+        # --- Initialize Sub-Modules ---
+        self.market_structure = MarketStructure(config, self) # Pass full config or just relevant parts
+        self.order_flow = OrderFlow(config, self)
+
+        # --- Load ML Models (Example) ---
+        # self.signal_model = None
+        # self.signal_model_scaler = None
+        # ml_config = self.config.get('machine_learning', {})
+        # model_path = ml_config.get('signal_model_path')
+        # scaler_path = ml_config.get('signal_model_scaler_path')
+        # if model_path and scaler_path:
+        #     try:
+        #         self.signal_model = joblib.load(model_path)
+        #         self.signal_model_scaler = joblib.load(scaler_path)
+        #         self.logger.info("Signal prediction model and scaler loaded.")
+        #     except Exception as e:
+        #         self.logger.error(f"Failed to load signal ML model/scaler: {e}")
+
+        # --- Performance Tracking (same as before) ---
+        self.signal_performance = {s: {'win_count': 0, 'loss_count': 0, 'total_profit': 0, 'total_loss': 0} for s in self.symbols}
+
+        # --- Timeframe Utilities (same as before) ---
+        # self.timeframe_intervals = { ... }
+        # self.freq_map = { ... }
+        # self.mt5_timeframe_map = { ... }
+
+        # --- Load initial history if applicable (same as before) ---
+        # if self.mt5_api and self.config['central_trading_bot']['mode'] == 'live':
+        #     self._load_initial_history()
+
+        self.logger.info("SignalGenerator initialized")
+
+    def _initialize_real_time_data(self) -> Dict:
+        """Initializes the real-time data structure for a symbol."""
+        # Store baseline data needed by OrderFlow, etc.
+        return {
+            'cumulative_delta': 0,
+            'delta_history': deque(maxlen=1000), # Maxlen configurable?
+            'bid_ask_imbalance': 0,
+            'composite_breadth_score': 0, # Example - keep if used
+            'tick': 0,
+            'cumulative_tick': 0,
+            'last_price': None,
+            'bid': None, # Store current bid/ask
+            'ask': None,
+            'last_volume': 0
+        }
+
+    # --- Data Handling Methods ---
+    # _validate_config, _load_initial_history, preprocess_tick, process_tick,
+    # _aggregate_tick, add_bar, update_real_time_data
+    # (Keep implementations from Signal_.txt, ensure update_real_time_data captures needed fields e.g. bid/ask)
+    # --- [Implementations for these methods based on Signal_.txt] ---
+
+    # --- Indicator Calculation (Consider Refactoring) ---
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate indicators NEEDED specifically by SignalGenerator's logic.
+        Most indicator calculations should ideally live within MarketStructure/OrderFlow.
+        """
+        self.logger.debug("Calculating SG-specific indicators (if any)...")
+        # --- Implementation Placeholder ---
+        # If SG needs its own indicators (e.g., for a final filter), calculate them here.
+        # Otherwise, this method might just return the input df.
+        # Example: Maybe calculate a very short-term momentum indicator here?
+        # df['mom_sg'] = ta.momentum.ROCIndicator(df['close'], window=5).roc()
+        return df
+
+    # --- Signal Generation Core Logic ---
+    def generate_signal_backtest(self, symbol: str, timeframe: str, ohlcv_data: pd.DataFrame,
+                              real_time_data: Dict, market_structure=None, order_flow=None) -> Optional[Dict[str, Any]]:
+        # --- Keep implementation from Signal_.txt---
+        # Adapter for backtesting frameworks
+        # ...
+        return self.generate_signal(symbol, timeframe, ohlcv_data, real_time_data, market_structure, order_flow)
+
+    def generate_signal(self, symbol: str, timeframe: str, ohlcv_data: pd.DataFrame,
+                       real_time_data: Dict, market_structure=None, order_flow=None) -> Optional[Dict[str, Any]]:
+        # --- Keep implementation from Signal_.txt---
+        # Adapter for backtesting frameworks, calls generate_signal_for_tf
+        # ...
+        try:
+            current_time = ohlcv_data.index[-1] if isinstance(ohlcv_data.index, pd.DatetimeIndex) else datetime.now(pytz.UTC)
+            return self.generate_signal_for_tf(
+                trading_tf=timeframe, symbol=symbol, current_time=current_time,
+                custom_df=ohlcv_data, custom_rtd=real_time_data
+            )
+        except Exception as e:
+            self.logger.error(f"Error in generate_signal adapter for {symbol} {timeframe}: {str(e)}")
+            return None
+
+
+    def generate_signal_for_tf(self, trading_tf: str, symbol: str, current_time: datetime,
+                                custom_df: pd.DataFrame = None, custom_rtd: Dict = None) -> Optional[Dict[str, Any]]:
+        """
+        Generate trading signal by orchestrating MS and OF analyses and applying decision logic.
+        """
+        try:
+            # Use custom data for backtesting or live data
+            rtd = custom_rtd if custom_rtd is not None else self.real_time_data.get(symbol)
+            # Use histories maintained by SG if custom_df not provided (live mode)
+            df_hist = custom_df if custom_df is not None else self.indicator_histories.get(symbol, {}).get(trading_tf)
+
+            if rtd is None or rtd.get('last_price') is None:
+                self.logger.debug(f"No real-time data for {symbol}")
+                return None
+            if df_hist is None or df_hist.empty:
+                self.logger.debug(f"Insufficient historical data for {symbol} on {trading_tf}")
+                return None
+
+            # Ensure minimum length for analysis lookbacks
+            # min_len_ms = self.market_structure.config.get('min_bars', 50) # Get required lookback from modules?
+            # min_len_of = self.order_flow.config.get('min_bars', 50)
+            # if len(df_hist) < max(min_len_ms, min_len_of): return None
+
+            # --- Run Analyses from Sub-Modules ---
+            # Ensure df passed has necessary base indicators (ATR etc.) calculated
+            # Consider if base indicator calculation should move into analyze methods of MS/OF
+            df_with_indicators = self.calculate_indicators(df_hist.copy()) # Calculate SG-specific indicators if any
+
+            structure_analysis = self.market_structure.analyze(symbol, trading_tf, df_with_indicators, current_time)
+            flow_analysis = self.order_flow.analyze(symbol, trading_tf, df_with_indicators, rtd, current_time)
+
+            if not structure_analysis or not structure_analysis.get('valid', False):
+                 self.logger.warning(f"Invalid MarketStructure analysis for {symbol} {trading_tf}: {structure_analysis.get('reason')}")
+                 # Decide how to handle: proceed with only flow? Return None?
+                 # return None # Stricter approach
+            if not flow_analysis or not flow_analysis.get('valid', False):
+                 self.logger.warning(f"Invalid OrderFlow analysis for {symbol} {trading_tf}: {flow_analysis.get('reason')}")
+                 # return None # Stricter approach
+
+            # --- Make Signal Decision ---
+            # Pass both analyses results to the evaluation logic
+            signal_decision = self._evaluate_combined_analysis(
+                symbol, trading_tf, structure_analysis, flow_analysis, current_time
+            )
+
+            if not signal_decision.get('generate_signal', False):
+                self.logger.debug(f"Signal criteria not met for {symbol} on {trading_tf}: {signal_decision.get('reason', 'Unknown')}")
+                return None
+
+            # --- Construct Final Signal ---
+            entry_price = rtd['last_price'] # Use latest tick price for entry
+            signal = self._construct_signal(
+                symbol, trading_tf, current_time, entry_price,
+                structure_analysis, flow_analysis, signal_decision
+            )
+
+            self.logger.info(f"Generated signal for {symbol} on {trading_tf}: {signal.get('action')} score {signal.get('score'):.2f}")
+            return signal
+
+        except Exception as e:
+            self.logger.error(f"Error generating signal for {symbol} on {trading_tf}: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return None # Return None on error
+
+    def _evaluate_combined_analysis(self, symbol: str, timeframe: str,
+                                   structure_analysis: Dict, flow_analysis: Dict,
+                                   current_time: datetime) -> Dict:
+        """
+        Evaluates combined MS and OF analysis using ML prediction, graph confluence,
+        or rule-based logic to decide on signal generation.
+        """
+        self.logger.debug(f"Evaluating combined analysis for {symbol} {timeframe}...")
+        # --- Implementation Required ---
+
+        # --- Option 1: ML Prediction (if model loaded) ---
+        # if self.signal_model and self.signal_model_scaler:
+        #     try:
+        #         features = self._extract_features_for_ml(structure_analysis, flow_analysis)
+        #         scaled_features = self.signal_model_scaler.transform([features])
+        #         prob_up = self.signal_model.predict_proba(scaled_features)[0, 1] # Assumes model predicts prob of 'up' (class 1)
+        #         prob_down = 1.0 - prob_up
+        #
+        #         ml_threshold = self.config_sg.get('ml_probability_threshold', 0.65)
+        #         action = "none"
+        #         score = 0.0
+        #         if prob_up > ml_threshold:
+        #             action = "buy"
+        #             score = prob_up * 10 # Scale probability 0-1 to 0-10
+        #         elif prob_down > ml_threshold:
+        #             action = "sell"
+        #             score = prob_down * 10
+        #
+        #         return {
+        #             'generate_signal': action != "none", 'action': action, 'score': score,
+        #             'reason': f"ML Prediction: P(up)={prob_up:.3f}", 'ml_prob_up': prob_up
+        #          }
+        #     except Exception as e_ml:
+        #         self.logger.error(f"ML Prediction failed for {symbol} {timeframe}: {e_ml}")
+        #         # Fallback to rule-based if ML fails? Or return no signal?
+
+        # --- Option 2: Graph-Based Confluence (Experimental Placeholder) ---
+        # if self.config_sg.get('use_graph_confluence', False):
+        #      try:
+        #          graph_score, path_info = self._run_graph_confluence(structure_analysis, flow_analysis)
+        #          graph_threshold = self.config_sg.get('graph_score_threshold', 5.0) # Example
+        #          action = "buy" if graph_score > graph_threshold else "sell" if graph_score < -graph_threshold else "none" # Example logic
+        #          return {
+        #             'generate_signal': action != "none", 'action': action, 'score': abs(graph_score),
+        #             'reason': f"Graph Confluence Score: {graph_score:.2f}", 'graph_path': path_info
+        #          }
+        #      except Exception as e_graph:
+        #          self.logger.error(f"Graph Confluence failed for {symbol} {timeframe}: {e_graph}")
+
+
+        # --- Option 3: Rule-Based / Score Combination (Refined version of original logic) ---
+        try:
+            # Get scores and key context from sub-modules (handle potential missing keys safely)
+            ms_score = structure_analysis.get('structure_score', 0) if structure_analysis else 0
+            ms_direction = structure_analysis.get('direction', 'sideways') if structure_analysis else 'sideways'
+            ms_wyckoff_phase = structure_analysis.get('wyckoff_phase', 'undefined') if structure_analysis else 'undefined'
+            ms_in_demand = structure_analysis.get('price_in_demand_zone', False) if structure_analysis else False
+            ms_in_supply = structure_analysis.get('price_in_supply_zone', False) if structure_analysis else False
+
+            of_score = flow_analysis.get('flow_score', 0) if flow_analysis else 0
+            of_direction = flow_analysis.get('direction', 'neutral') if flow_analysis else 'neutral'
+            of_vsa = flow_analysis.get('vsa_signal', 'none') if flow_analysis else 'none'
+            of_absorption = flow_analysis.get('absorption', {}).get('direction', 'neutral') if flow_analysis else 'neutral'
+
+            # --- Dynamic Threshold Logic ---
+            # Example: Adjust threshold based on regime or vol? Requires Risk module input potentially.
+            buy_threshold = self.thresholds.get('buy_threshold', 7.0) # Get base threshold
+            sell_threshold = self.thresholds.get('sell_threshold', 7.0)
+            # Add logic here to adjust buy_threshold / sell_threshold based on regime, GARCH vol etc.
+            # regime = structure_analysis.get('regime', 'undefined')
+            # garch_vol = flow_analysis.get('garch_volatility_forecast')
+            # if regime == 'volatile...' or (garch_vol and garch_vol > HIGH_VOL_THRESH):
+            #      buy_threshold += 1.0; sell_threshold += 1.0 # Example: Increase threshold in high vol
+
+            # --- Define Confluence Rules ---
+            # Combine scores (e.g., weighted average)
+            ms_weight = self.config_sg.get('structure_weight', 0.6)
+            of_weight = self.config_sg.get('flow_weight', 0.4)
+            combined_score = (ms_score * ms_weight) + (of_score * of_weight)
+
+            action = "none"
+            reason = f"CombinedScore={combined_score:.2f} (MS:{ms_score:.1f}, OF:{of_score:.1f})"
+
+            # Rule examples (needs significant refinement based on strategy)
+            # Buy Signal Conditions:
+            if (ms_direction == 'uptrend' and of_direction == 'up' and combined_score >= buy_threshold):
+                # Base condition: Structure and Flow align up, score is high
+                action = "buy"
+                reason += f" | MS+OF Align Up, Score >= {buy_threshold:.1f}"
+                # Add confirmations:
+                # if ms_in_demand: reason += ", In DemandZone"
+                # if of_absorption == 'bear_absorption': reason += ", Bear Absorp"
+                # if of_vsa == 'NoSupply': reason += ", VSA NoSupply"
+
+            # Sell Signal Conditions:
+            elif (ms_direction == 'downtrend' and of_direction == 'down' and combined_score >= sell_threshold):
+                action = "sell"
+                reason += f" | MS+OF Align Down, Score >= {sell_threshold:.1f}"
+                # Add confirmations:
+                # if ms_in_supply: reason += ", In SupplyZone"
+                # if of_absorption == 'bull_absorption': reason += ", Bull Absorp"
+                # if of_vsa == 'NoDemand': reason += ", VSA NoDemand"
+
+            # Add other potential entry types (e.g., reversals at S/D zones confirmed by flow)
+
+            return {
+                'generate_signal': action != "none",
+                'action': action,
+                'score': combined_score, # Use combined score for ranking/sizing
+                'reason': reason,
+                'threshold_used': buy_threshold if action == 'buy' else sell_threshold if action == 'sell' else None
+            }
+        except Exception as e_rule:
+             self.logger.error(f"Error in Rule-Based Evaluation for {symbol} {timeframe}: {e_rule}")
+             return {'generate_signal': False, 'reason': f'Rule error: {e_rule}'}
+
+
+    def _construct_signal(self, symbol: str, timeframe: str, timestamp: datetime,
+                        entry_price: float, structure_analysis: Dict, flow_analysis: Dict,
+                        signal_decision: Dict) -> Dict[str, Any]:
+        """
+        Constructs the final signal dictionary with refined SL/TP logic.
+        """
+        # --- Update Existing Logic---
+        try:
+            action = signal_decision.get('action', 'none')
+            score = signal_decision.get('score', 0) # Combined score from evaluation
+            signal_id = str(uuid.uuid4())
+
+            # --- Refined SL/TP Calculation ---
+            stop_loss = None
+            take_profit = None
+            sl_reason = "Default ATR"
+            tp_reason = "Default R:R"
+
+            # Prioritize S/D zones from MarketStructure analysis
+            nearest_supply = structure_analysis.get('nearest_supply')
+            nearest_demand = structure_analysis.get('nearest_demand')
+            # Get ATR for fallback/buffer calculation
+            df = self.indicator_histories.get(symbol, {}).get(timeframe) # Get df for ATR
+            atr = df['atr'].iloc[-1] if (df is not None and 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1])) else entry_price * 0.01
+            atr = max(atr, 0.00001) # Ensure positive
+            sl_buffer_atr = self.config_sg.get('sl_buffer_atr', 0.2) # Buffer beyond zone edge
+
+            if action == 'buy':
+                 # SL: Below nearest demand zone or recent low?
+                 if nearest_demand:
+                      stop_loss = nearest_demand - (atr * sl_buffer_atr)
+                      sl_reason = f"Below Demand Zone ({nearest_demand:.{df.attrs.get('dp', 5)}f})"
+                 # else: Use Wyckoff event level (e.g., Spring low)? Or fallback ATR?
+
+                 # TP: Before nearest supply zone or Wyckoff PnF target?
+                 if nearest_supply:
+                      take_profit = nearest_supply - (atr * sl_buffer_atr) # Target slightly below supply
+                      tp_reason = f"Below Supply Zone ({nearest_supply:.{df.attrs.get('dp', 5)}f})"
+                 # else: Use Wyckoff target? Or R:R based on SL?
+
+            elif action == 'sell':
+                 # SL: Above nearest supply zone or recent high?
+                 if nearest_supply:
+                      stop_loss = nearest_supply + (atr * sl_buffer_atr)
+                      sl_reason = f"Above Supply Zone ({nearest_supply:.{df.attrs.get('dp', 5)}f})"
+                 # else: Use Wyckoff UTAD high? Fallback ATR?
+
+                 # TP: Above nearest demand zone or Wyckoff PnF target?
+                 if nearest_demand:
+                      take_profit = nearest_demand + (atr * sl_buffer_atr) # Target slightly above demand
+                      tp_reason = f"Above Demand Zone ({nearest_demand:.{df.attrs.get('dp', 5)}f})"
+                 # else: Use Wyckoff target? R:R?
+
+            # --- Fallback / R:R Calculation if zones/targets missing ---
+            if stop_loss is None:
+                # Fallback to ATR SL
+                sl_multiplier = self.config.get('stop_loss_atr_multiplier', 2.0)
+                stop_loss = entry_price - atr * sl_multiplier if action == 'buy' else entry_price + atr * sl_multiplier
+                sl_reason = f"ATR Fallback ({sl_multiplier:.1f}x)"
+
+            if take_profit is None:
+                # Fallback to R:R based on calculated SL distance
+                sl_distance = abs(entry_price - stop_loss)
+                rr_ratio = self.config.get('risk_reward_ratio', 1.5)
+                take_profit = entry_price + sl_distance * rr_ratio if action == 'buy' else entry_price - sl_distance * rr_ratio
+                tp_reason = f"R:R Fallback ({rr_ratio:.1f}x)"
+
+
+            # Position Size Modifier (Example: based on score)
+            # More complex sizing could use Kelly Criterion from Risk Mgmt module
+            confidence_factor = score / 10.0 # Score is 0-10
+            position_size_modifier = min(1.2, max(0.5, 0.5 + confidence_factor * 0.7)) # Scale between 0.5 and 1.2 based on score
+
+
+            signal = {
+                'id': signal_id,
+                'valid': True,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'timestamp': timestamp.isoformat(),
+                'action': action,
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'score': score, # Final score from evaluation
+                'confidence_modifier': position_size_modifier, # For position sizing
+                'metadata': { # Include supporting info for execution/logging
+                    'ms_direction': structure_analysis.get('direction'),
+                    'of_direction': flow_analysis.get('direction'),
+                    'ms_score': structure_analysis.get('structure_score'),
+                    'of_score': flow_analysis.get('flow_score'),
+                    'wyckoff_phase': structure_analysis.get('wyckoff_phase'),
+                    'nearest_supply': structure_analysis.get('nearest_supply'),
+                    'nearest_demand': structure_analysis.get('nearest_demand'),
+                    'vsa_signal': flow_analysis.get('vsa_signal'),
+                    'sl_reason': sl_reason,
+                    'tp_reason': tp_reason,
+                    # Add ML prob if used: 'ml_prob_up': signal_decision.get('ml_prob_up')
+                    # Add Graph info if used: 'graph_score': signal_decision.get('graph_score')
+                 }
+            }
+            return signal
+
+        except Exception as e:
+            self.logger.error(f"Error constructing signal for {symbol} {timeframe}: {str(e)}")
+            return {'valid': False, 'error': f'Signal construction error: {e}'}
+
+
+    # --- NEW Placeholder Methods for SG ---
+
+    def _extract_features_for_ml(self, structure_analysis: Dict, flow_analysis: Dict) -> List:
+        """Placeholder: Extracts and orders features for the ML prediction model."""
+        # --- Implementation Required ---
+        # Must match the features the model was trained on, in the correct order.
+        # Handle missing data / invalid analyses carefully (e.g., impute with defaults?)
+        self.logger.debug("Extracting features for ML model (Placeholder)...")
+        features = []
+        # Example features:
+        # features.append(structure_analysis.get('structure_score', 5.0)) # Use 5 if invalid?
+        # features.append(flow_analysis.get('flow_score', 5.0))
+        # features.append(1 if structure_analysis.get('direction') == 'uptrend' else -1 if structure_analysis.get('direction') == 'downtrend' else 0)
+        # features.append(1 if flow_analysis.get('direction') == 'up' else -1 if flow_analysis.get('direction') == 'down' else 0)
+        # features.append(structure_analysis.get('hurst_interpretation_encoded', 0)) # Need numeric encoding
+        # features.append(flow_analysis.get('inventory',{}).get('position',0)) # Example inventory
+        # ... add many more features based on MS/OF outputs ...
+        if not features: raise ValueError("No features extracted for ML model")
+        return features
+
+    def _run_graph_confluence(self, structure_analysis: Dict, flow_analysis: Dict) -> Tuple[float, Any]:
+        """Placeholder: Implements experimental graph-based signal confluence."""
+        # --- Implementation Required ---
+        self.logger.debug("Running Graph Confluence Analysis (Placeholder)...")
+        # 1. Define Nodes: Represent key states/signals from MS & OF (e.g., 'MS_Uptrend', 'OF_Delta_Strong_Up', 'In_Demand_Zone', 'Wyckoff_Phase_Markup').
+        # 2. Define Edges & Weights: Define relationships and assign weights based on historical correlation, reliability, or predefined logic.
+        # 3. Build Graph: Use a library like networkx.
+        # 4. Apply Algorithm: Use Dijkstra, or potentially other graph algorithms (centrality, pathfinding) to derive a score or identify the strongest confirmation path.
+        # 5. Return Score/Path Info.
+        graph_score = 0.0
+        path_info = None
+        # ... implementation needed ...
+        return graph_score, path_info
+
+    # --- Include other necessary private methods ---
+    # e.g. _get_timeframe_hierarchy if needed internally, though likely used by MS/OF now
+    # e.g. _load_initial_history, _validate_config, preprocess_tick, _aggregate_tick, update_real_time_data, add_bar (copy from Signal_.txt)
+
+    # --- Performance Tracking ---
+    def update_signal_performance(self, signal: Dict, profit: float):
+        # --- Keep implementation from Signal_.txt---
+        # ...
+        pass # Replace with actual implementation
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass

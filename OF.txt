@@ -1,0 +1,623 @@
+# Necessary Imports (ensure all are installed)
+import pandas as pd
+import numpy as np
+import logging
+import pytz
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple
+from collections import deque
+import traceback
+try:
+    from arch import arch_model # Example: For GARCH
+    from arch.univariate import ConstantMean, Garch, Normal
+except ImportError:
+    logging.warning("ARCH library not found. GARCH functionality will be disabled.")
+    arch_model = None # Define as None if import fails
+try:
+    from scipy.stats import entropy # For KL Divergence
+    from scipy.spatial.distance import jensenshannon # For JSD
+    # Note: JSD in scipy expects probability distributions (sum to 1) and base 2 logarithm.
+except ImportError:
+    logging.warning("SciPy library not found or incomplete. Divergence calculations will be disabled.")
+    entropy = None
+    jensenshannon = None
+
+
+class OrderFlow:
+    """
+    Order Flow analysis module for examining transaction dynamics,
+    buying/selling pressure, liquidity characteristics, VSA patterns,
+    and flow regime shifts. Includes adaptive thresholds and heuristics.
+    """
+
+    def __init__(self, config: Dict, parent=None):
+        """
+        Initialize the OrderFlow module.
+
+        Args:
+            config (Dict): Configuration dictionary (expects relevant keys, potentially nested)
+            parent: Parent SignalGenerator instance (optional)
+        """
+        self.parent = parent
+        self.config_full = config # Keep full config for potentially accessing other sections
+        self.config = config.get('order_flow', {}) # Use order_flow sub-config primarily
+        self.logger = logging.getLogger(__name__)
+
+        # --- Symbol and Timeframe Initialization ---
+        if parent and hasattr(parent, 'symbols'):
+            self.symbols = parent.symbols
+        else:
+            main_symbols = self.config_full.get('symbols', [])
+            central_config = self.config_full.get('central_trading_bot', {})
+            backtest_mode = central_config.get('mode') == 'backtest'
+            backtest_symbols = self.config_full.get('backtesting', {}).get('symbols', [])
+            if backtest_mode and backtest_symbols:
+                self.symbols = list(set(main_symbols + backtest_symbols))
+            else:
+                self.symbols = main_symbols
+
+        if parent and hasattr(parent, 'timeframes'):
+            self.timeframes = parent.timeframes
+        else:
+            signal_gen_config = self.config_full.get('signal_generation', {})
+            self.timeframes = signal_gen_config.get('timeframes', ['15min', '1h', '4h', 'daily'])
+
+        # --- Configuration Parameters ---
+        # Existing (from file)
+        self.base_delta_threshold = self.config.get('delta_threshold', 500)
+        self.base_imbalance_threshold = self.config.get('imbalance_threshold', 0.2)
+        self.base_absorption_ratio = self.config.get('absorption_ratio', 1.5)
+        self.threshold_update_interval = self.config.get('threshold_update_interval', 3600)
+        self.volatility_multiplier = self.config.get('volatility_multiplier', 1.2)
+        self.liquidity_adjustment = self.config.get('liquidity_adjustment', 0.8)
+        self.inventory_max_position = self.config.get('max_inventory', 100)
+        self.inventory_risk_aversion = self.config.get('inventory_risk_aversion', 0.5)
+        self.inventory_mean_reversion_rate = self.config.get('mean_reversion_rate', 0.1)
+        self.impact_base = self.config.get('base_impact', 0.0001)
+        self.impact_nonlinear_factor = self.config.get('nonlinear_factor', 1.5)
+        self.bayes_max_observations = self.config.get('bayes_max_observations', 100)
+        self.bayes_quality_threshold = self.config.get('bayes_quality_threshold', 7.0)
+        self.bayes_update_blend_factor = self.config.get('bayes_update_blend_factor', 0.8)
+
+        # New Parameters for GARCH, VSA, Divergence
+        self.garch_p = self.config.get('garch_p', 1)
+        self.garch_q = self.config.get('garch_q', 1)
+        self.garch_vol_model = self.config.get('garch_vol_model', 'GARCH') # GARCH, EGARCH, etc.
+        self.garch_dist = self.config.get('garch_dist', 'Normal') # Normal, t, etc.
+        self.garch_retrain_interval = self.config.get('garch_retrain_interval', 86400) # Retrain daily default
+        self.garch_min_data = self.config.get('garch_min_data', 252) # Min bars to fit GARCH
+        self.flow_divergence_window = self.config.get('flow_divergence_window', 50)
+        self.flow_divergence_baseline_window = self.config.get('flow_divergence_baseline_window', 200)
+        self.flow_divergence_bins = self.config.get('flow_divergence_bins', 10) # Bins for histogram
+        self.flow_divergence_threshold = self.config.get('flow_divergence_threshold', 0.1) # Threshold for JSD/KL score
+        self.vsa_volume_avg_period = self.config.get('vsa_volume_avg_period', 20)
+        self.vsa_vol_factor_high = self.config.get('vsa_vol_factor_high', 2.0) # Threshold for high volume
+        self.vsa_vol_factor_low = self.config.get('vsa_vol_factor_low', 0.5) # Threshold for low volume
+        self.vsa_spread_factor = self.config.get('vsa_spread_factor', 0.5) # Threshold for narrow spread relative to ATR
+
+        # Flow Score Weights (Adjusted to include new factors)
+        self.flow_weights = self.config.get('flow_weights', {
+            'delta': 3, 'bid_ask_imbalance': 2, 'absorption': 2,
+            'effort_vs_result': 2, 'liquidity': 1,
+            'transaction_intensity': 1, 'institutional': 3,
+            'inventory': 1, 'vsa_signal': 2, 'flow_divergence': 2
+        })
+
+        # --- Caches & State ---
+        # Existing
+        self.dynamic_thresholds = {s: {
+            'delta_threshold': self.base_delta_threshold,
+            'imbalance_threshold': self.base_imbalance_threshold,
+            'absorption_ratio': self.base_absorption_ratio,
+            'last_update': None, 'volatility_used': None # Track vol used
+            } for s in self.symbols}
+        self.volume_profile_cache = {s: {tf: {} for tf in self.timeframes} for s in self.symbols}
+        self.institutional_activity_markers = {s: {'timestamp': None, 'level': None, 'direction': None} for s in self.symbols} # Added direction
+        self.footprint_data = {s: {tf: {} for tf in self.timeframes} for s in self.symbols} # Unused
+        self.inventory_model = {s: {
+            'position': 0, 'neutral_level': 0, 'max_position': self.inventory_max_position,
+            'risk_aversion': self.inventory_risk_aversion, 'mean_reversion_rate': self.inventory_mean_reversion_rate,
+            'last_update': None
+            } for s in self.symbols}
+        self.bayesian_params = {s: {
+            'delta_prior_mean': self.base_delta_threshold, 'delta_prior_var': self.base_delta_threshold * 0.5,
+            'imbalance_prior_mean': self.base_imbalance_threshold, 'imbalance_prior_var': 0.05,
+            'observations': deque(maxlen=self.bayes_max_observations) # Use deque here
+            } for s in self.symbols}
+        self.market_impact = {s: {
+            'base_impact': self.impact_base, 'nonlinear_factor': self.impact_nonlinear_factor,
+            'recent_volume': deque(maxlen=50), 'spread_history': deque(maxlen=50), # Use deques to store recent history
+            'volatility_factor': 1.0
+            } for s in self.symbols}
+
+        # New Caches
+        self.garch_models = {s: {tf: {'model': None, 'last_retrain': None, 'last_forecast': None, 'last_forecast_time': None} for tf in self.timeframes} for s in self.symbols}
+        self.flow_baseline_dist = {s: {tf: None for tf in self.timeframes} for s in self.symbols} # Store baseline distributions
+
+
+        self.logger.info("OrderFlow module initialized (Comprehensive Structure)")
+
+
+    # --- Core Analysis Method ---
+    def analyze(self, symbol: str, timeframe: str, df: pd.DataFrame,
+                real_time_data: Dict[str, Any], current_time: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Perform comprehensive order flow analysis, including GARCH, VSA, Divergence.
+        """
+        try:
+            if df is None or df.empty or len(df) < max(20, self.garch_min_data): # Check GARCH min data too
+                return {'valid': False, 'reason': 'Insufficient historical data'}
+            if real_time_data is None or 'last_price' not in real_time_data or real_time_data['last_price'] is None:
+                return {'valid': False, 'reason': 'Insufficient real-time data'}
+
+            analysis_time = current_time or datetime.now(pytz.UTC)
+            df_analysis = df.copy() # Work on a copy
+
+            # --- Ensure Base Indicators (ATR needed for vol calcs) ---
+            if 'atr' not in df_analysis.columns or df_analysis['atr'].iloc[-20:].isna().any():
+                 try:
+                      # Use ta library for ATR calculation
+                      atr_indicator = ta.volatility.AverageTrueRange(df_analysis['high'], df_analysis['low'], df_analysis['close'], window=14)
+                      df_analysis['atr'] = atr_indicator.average_true_range()
+                      df_analysis['atr'].fillna(method='bfill', inplace=True)
+                      df_analysis['atr'].fillna(0.0001, inplace=True)
+                      if df_analysis['atr'].iloc[-1] <= 0: raise ValueError("Invalid ATR")
+                 except Exception as e:
+                      self.logger.error(f"Fatal error calculating ATR for {symbol} {timeframe} in OrderFlow: {e}")
+                      return {'valid': False, 'reason': f'ATR calculation error: {e}'}
+
+
+            # --- Volatility Forecasting ---
+            garch_vol_forecast = self._get_garch_volatility(symbol, timeframe, df_analysis, analysis_time)
+
+            # --- Update Dynamic Thresholds ---
+            self._update_dynamic_thresholds(symbol, df_analysis, real_time_data, analysis_time, garch_vol_forecast)
+            current_thresholds = self.dynamic_thresholds[symbol]
+
+            # --- Existing Analyses ---
+            delta_analysis = self.analyze_delta(symbol, timeframe, df_analysis, real_time_data, current_thresholds.get('delta_threshold'))
+            bid_ask = self.analyze_bid_ask_dynamics(symbol, real_time_data, current_thresholds.get('imbalance_threshold'))
+            # Volume Profile requires volume
+            volume_profile = self.analyze_volume_profile(symbol, timeframe, df_analysis) if 'volume' in df_analysis.columns else {'valid': False, 'reason': 'Volume missing'}
+            liquidity = self.detect_liquidity_zones(symbol, timeframe, df_analysis) # Requires volume, ATR
+            absorption = self.check_absorption(symbol, timeframe, df_analysis, real_time_data, current_thresholds.get('absorption_ratio')) # Requires volume
+            effort_result = self.analyze_effort_vs_result(symbol, timeframe, df_analysis) # Requires volume
+            institutional = self.detect_institutional_activity(symbol, df_analysis, real_time_data) # Requires volume
+            intensity = self.calculate_transaction_intensity(symbol, real_time_data) # Uses delta history
+
+            # --- New Analyses ---
+            vsa_analysis = self._analyze_vsa_patterns(df_analysis) if 'volume' in df_analysis.columns else {'valid': False, 'reason': 'Volume missing'}
+            flow_divergence_analysis = self._calculate_flow_divergence(symbol, timeframe, df_analysis, real_time_data)
+
+            # --- Determine Direction & Score ---
+            direction = self._determine_flow_direction(delta_analysis, bid_ask, absorption, institutional)
+            self._update_inventory_model(symbol, real_time_data, analysis_time)
+            inventory_adjustment = self._calculate_inventory_adjustment(symbol, direction)
+
+            flow_score_details = self.calculate_flow_score(
+                symbol=symbol, timeframe=timeframe,
+                delta_analysis=delta_analysis, bid_ask=bid_ask, liquidity=liquidity,
+                absorption=absorption, effort_result=effort_result, institutional=institutional,
+                intensity=intensity, inventory_adjustment=inventory_adjustment,
+                vsa_analysis=vsa_analysis, flow_divergence=flow_divergence_analysis
+            )
+
+            # --- Update Bayesian Params ---
+            self._update_bayesian_parameters(symbol, delta_analysis, bid_ask, flow_score_details)
+
+            # --- Calculate Market Impact & Update History ---
+            # Update market impact history (e.g., recent volume, spread) before calculating
+            self._update_market_impact_history(symbol, df_analysis, real_time_data)
+            market_impact = self._calculate_market_impact(symbol, 1.0) # Example size
+
+            # --- Construct Output Dictionary ---
+            analysis = {
+                'valid': True,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'timestamp': df_analysis.index[-1].isoformat() if isinstance(df_analysis.index, pd.DatetimeIndex) else analysis_time.isoformat(),
+
+                # Core Outputs for SignalGenerator
+                'direction': direction,
+                'flow_score': flow_score_details.get('score', 0),
+                'flow_score_components': flow_score_details.get('components', {}),
+
+                # New Analysis Outputs
+                'garch_volatility_forecast': garch_vol_forecast,
+                'vsa_signal': vsa_analysis.get('signal', 'none'),
+                'vsa_confidence': vsa_analysis.get('confidence', 0.0),
+                'flow_divergence_score': flow_divergence_analysis.get('score', 0.0),
+                'flow_divergence_interpretation': flow_divergence_analysis.get('interpretation', 'normal'),
+
+                # Existing Analysis Outputs (pass relevant dicts)
+                'delta': delta_analysis,
+                'bid_ask': bid_ask,
+                'liquidity': liquidity, # From detect_liquidity_zones
+                'volume_profile': volume_profile, # Separate from liquidity zones
+                'absorption': absorption,
+                'effort_result': effort_result,
+                'institutional': institutional,
+                'intensity': intensity,
+                'inventory': self.inventory_model[symbol],
+                'dynamic_thresholds': current_thresholds,
+                'market_impact': market_impact,
+
+                'analysis_time': datetime.now(pytz.UTC).isoformat()
+            }
+            return analysis
+
+        except Exception as e:
+            self.logger.error(f"Critical Error in OrderFlow analyze for {symbol} on {timeframe}: {str(e)}")
+            self.logger.debug(traceback.format_exc())
+            return {'valid': False, 'reason': f'Error in analyze: {str(e)}'}
+
+
+    # --- New Methods Placeholders ---
+
+    def _get_garch_volatility(self, symbol: str, timeframe: str, df: pd.DataFrame, current_time: datetime) -> Optional[float]:
+        """Fits/Updates GARCH model and returns 1-step ahead volatility forecast."""
+        # --- Implementation Required ---
+        if arch_model is None: # Check if library loaded
+             #self.logger.warning("Arch library not loaded, skipping GARCH.")
+             return None
+        self.logger.debug(f"Calculating GARCH vol for {symbol} {timeframe}...")
+
+        cache = self.garch_models[symbol][timeframe]
+        last_forecast_time = cache.get('last_forecast_time')
+        # Check if forecast is recent enough (e.g., within the bar interval)
+        # This prevents recalculating forecast for every tick within the same bar
+        bar_duration = getattr(self.parent, 'timeframe_intervals', {}).get(timeframe, timedelta(minutes=1)).total_seconds()
+        if last_forecast_time and (current_time - last_forecast_time).total_seconds() < bar_duration:
+             return cache.get('last_forecast') # Return cached forecast for this bar
+
+        try:
+            if len(df) < self.garch_min_data:
+                self.logger.debug(f"Skipping GARCH for {symbol} {timeframe}: Need {self.garch_min_data} bars, have {len(df)}")
+                return None
+
+            # 1. Data Prep: Use log returns, handle zeros/NaNs
+            returns = np.log(df['close'] / df['close'].shift(1)).dropna() * 100 # Percentage log returns
+            returns = returns[np.isfinite(returns)] # Ensure finite values
+            if len(returns) < self.garch_min_data:
+                self.logger.debug(f"Skipping GARCH for {symbol} {timeframe}: Not enough finite returns ({len(returns)})")
+                return None
+
+            # 2. Check Retrain Interval
+            last_retrain_time = cache.get('last_retrain')
+            model = cache.get('model')
+            needs_retrain = model is None or last_retrain_time is None or \
+                            (current_time - last_retrain_time).total_seconds() >= self.garch_retrain_interval
+
+            if needs_retrain:
+                self.logger.info(f"Retraining GARCH({self.garch_p},{self.garch_q}) for {symbol} {timeframe}")
+                # Define model - make distribution configurable too
+                vol_model = Garch(p=self.garch_p, q=self.garch_q) if self.garch_vol_model == 'GARCH' else None # Add other models like EGARCH if needed
+                if vol_model is None: raise ValueError(f"Unsupported GARCH model type: {self.garch_vol_model}")
+                dist = Normal() if self.garch_dist == 'Normal' else None # Add other distributions if needed
+                if dist is None: raise ValueError(f"Unsupported GARCH distribution: {self.garch_dist}")
+
+                # Use Constant Mean model for returns
+                am = arch_model(returns, mean='Constant', vol=vol_model, dist=dist)
+                # Fit model - handle convergence issues
+                model = am.fit(update_freq=0, disp='off', show_warning=False)
+                cache['model'] = model
+                cache['last_retrain'] = current_time
+                self.logger.info(f"GARCH model retrained successfully for {symbol} {timeframe}.")
+
+            # 3. Forecast
+            if model:
+                # Forecast 1 step ahead variance
+                forecasts = model.forecast(horizon=1, reindex=False)
+                forecast_var = forecasts.variance.iloc[-1, 0]
+
+                # Ensure variance is positive
+                if forecast_var > 0:
+                    # Convert variance to annualized std dev percentage
+                    # Need appropriate scaling factor based on timeframe (e.g., bars per year)
+                    # Simple example assuming daily data -> 252 trading days
+                    # For intraday, need bars_per_day * 252 (e.g., for 1h on 24/5 market -> 24*252)
+                    # This needs careful thought based on market hours and timeframe!
+                    scaling_factor = 252 # Placeholder - ADJUST BASED ON TIMEFRAME AND MARKET HOURS
+                    forecast_annual_std_dev = np.sqrt(forecast_var * scaling_factor)
+                    cache['last_forecast'] = forecast_annual_std_dev
+                    cache['last_forecast_time'] = current_time # Store time of this forecast
+                    return forecast_annual_std_dev
+                else:
+                    self.logger.warning(f"GARCH forecast variance non-positive for {symbol} {timeframe}: {forecast_var}")
+                    return None # Return None if forecast invalid
+            else:
+                return None # Return None if no model available
+
+        except Exception as e:
+            self.logger.error(f"Error during GARCH calculation for {symbol} {timeframe}: {e}")
+            # traceback.print_exc() # Optional for detailed debug
+            cache['model'] = None # Invalidate model on error
+            return None
+
+    def _analyze_vsa_patterns(self, df: pd.DataFrame) -> Dict:
+        """Analyzes the last bar for specific Volume Spread Analysis patterns."""
+        # --- Implementation Required ---
+        self.logger.debug("Analyzing VSA patterns (Placeholder)...")
+        signal = 'none'
+        confidence = 0.0
+        try:
+            if len(df) < self.vsa_volume_avg_period + 1: return {'signal': 'no_data', 'confidence': 0}
+            if 'volume' not in df.columns or 'atr' not in df.columns: return {'signal': 'no_data', 'confidence': 0}
+
+            last_bar = df.iloc[-1]
+            prev_bar = df.iloc[-2]
+            avg_vol = df['volume'].rolling(window=self.vsa_volume_avg_period).mean().iloc[-2] # Avg vol PRIOR to last bar
+            atr = df['atr'].iloc[-2] # ATR PRIOR to last bar
+
+            if avg_vol <= 0 or atr <= 0: return {'signal': 'calc_error', 'confidence': 0} # Avoid division by zero
+
+            # Bar Attributes
+            bar_range = last_bar['high'] - last_bar['low']
+            is_up_bar = last_bar['close'] > last_bar['open']
+            is_down_bar = last_bar['close'] < last_bar['open']
+            close_pos = (last_bar['close'] - last_bar['low']) / bar_range if bar_range > 0 else 0.5 # Close position 0-1
+            vol_factor = last_bar['volume'] / avg_vol
+            spread_factor = bar_range / atr
+
+            # --- VSA Rule Examples (Needs Refinement and Testing!) ---
+            # 1. No Demand Bar
+            if is_up_bar and spread_factor < self.vsa_spread_factor and vol_factor < self.vsa_vol_factor_low and last_bar['close'] < prev_bar['close']:
+                 signal = 'NoDemand'
+                 confidence = 0.7 # Example confidence
+
+            # 2. No Supply Bar
+            elif is_down_bar and spread_factor < self.vsa_spread_factor and vol_factor < self.vsa_vol_factor_low and last_bar['close'] > prev_bar['close']:
+                 signal = 'NoSupply'
+                 confidence = 0.7
+
+            # 3. Upthrust (Pseudo)
+            elif is_up_bar and close_pos < 0.33 and vol_factor > self.vsa_vol_factor_high: # Closes near low on high vol
+                 signal = 'UpthrustPotential'
+                 confidence = 0.6
+
+            # 4. Stopping Volume (Potential Climax)
+            elif spread_factor > 1.5 and vol_factor > self.vsa_vol_factor_high and 0.33 < close_pos < 0.66: # Wide spread, high vol, mid close
+                 signal = 'StoppingVolumePotential'
+                 confidence = 0.65
+
+            # Add more VSA pattern detection rules here...
+
+        except Exception as e:
+            self.logger.error(f"Error analyzing VSA patterns: {e}")
+            signal = 'error'
+            confidence = 0.0
+
+        return {'signal': signal, 'confidence': confidence}
+
+
+    def _calculate_flow_divergence(self, symbol: str, timeframe: str, df: pd.DataFrame, real_time_data: Dict) -> Dict:
+        """Calculates divergence between recent and baseline order flow distributions using JSD."""
+        # --- Implementation Required ---
+        if jensenshannon is None: # Check if library loaded
+             #self.logger.warning("SciPy jensenshannon not available, skipping flow divergence.")
+             return {'score': 0.0, 'interpretation': 'disabled'}
+        self.logger.debug("Calculating Flow Divergence (Placeholder)...")
+
+        score = 0.0
+        interpretation = 'no_data'
+
+        try:
+            delta_history = real_time_data.get('delta_history')
+            if not isinstance(delta_history, deque) or len(delta_history) < self.flow_divergence_baseline_window:
+                 return {'score': score, 'interpretation': 'insufficient_data'}
+
+            # Ensure deque is converted to list/array for indexing
+            delta_list = list(delta_history)
+
+            # 1. Get Distributions (using delta values as example flow data)
+            recent_deltas = np.array(delta_list[-self.flow_divergence_window:])
+            baseline_deltas = np.array(delta_list[-self.flow_divergence_baseline_window:])
+
+            # Create histograms (probability distributions)
+            # Define common bins based on combined range or baseline range
+            min_val = baseline_deltas.min()
+            max_val = baseline_deltas.max()
+            if min_val == max_val: # Handle case with no variation
+                 return {'score': 0.0, 'interpretation': 'no_variation'}
+            bins = np.linspace(min_val, max_val, self.flow_divergence_bins + 1)
+
+            p_hist, _ = np.histogram(recent_deltas, bins=bins, density=True)
+            q_hist, _ = np.histogram(baseline_deltas, bins=bins, density=True)
+
+            # Add small epsilon to avoid zero probabilities for JSD/KL calculation
+            epsilon = 1e-10
+            p_dist = p_hist + epsilon
+            q_dist = q_hist + epsilon
+            p_dist /= p_dist.sum() # Re-normalize
+            q_dist /= q_dist.sum() # Re-normalize
+
+            # 2. Calculate JSD (Jensen-Shannon Divergence)
+            # Scipy's JSD returns distance (sqrt(JSD)), uses base 2 log. Square it for divergence value.
+            js_distance = jensenshannon(p_dist, q_dist, base=2.0)
+            if not pd.isna(js_distance):
+                 score = js_distance**2 # JSD value (ranges 0 to 1 for base 2)
+            else:
+                 score = 0.0 # Handle potential NaN result
+
+            # 3. Interpret Score
+            if score > self.flow_divergence_threshold * 1.5: # Needs tuning
+                 interpretation = 'strongly_diverging'
+            elif score > self.flow_divergence_threshold:
+                 interpretation = 'diverging'
+            else:
+                 interpretation = 'normal'
+
+        except Exception as e:
+            self.logger.error(f"Error calculating flow divergence for {symbol} {timeframe}: {e}")
+            interpretation = 'error'
+            score = 0.0
+
+        return {'score': score, 'interpretation': interpretation}
+
+
+    # --- Update calculate_flow_score to include new components ---
+    def calculate_flow_score(self, symbol: str, timeframe: str,
+                            delta_analysis: Dict[str, Any], bid_ask: Dict[str, Any],
+                            liquidity: Dict[str, Any], absorption: Dict[str, Any],
+                            effort_result: Dict[str, Any], institutional: Dict[str, Any],
+                            intensity: Dict[str, Any], inventory_adjustment: float = 0.0,
+                            vsa_analysis: Optional[Dict] = None, # Added
+                            flow_divergence: Optional[Dict] = None # Added
+                            ) -> Dict[str, Any]:
+        """Calculate comprehensive order flow score, including VSA and Divergence."""
+        # --- Update Existing Logic ---
+        try:
+            score = 0.0
+            component_scores = {}
+            positive_max_score = 0.0 # Sum of positive weights for normalization
+
+            def add_component(name, weight, value, details={}):
+                 nonlocal score, positive_max_score
+                 component_score = weight * value
+                 score += component_score
+                 if weight > 0: positive_max_score += weight
+                 component_scores[name] = {'weighted': component_score, 'weight': weight, 'raw_value': value, **details}
+
+            # 1. Delta Analysis
+            delta_weight = self.flow_weights.get('delta', 0)
+            delta_val = 0.0
+            if delta_analysis.get('valid', False):
+                 delta_strength = delta_analysis.get('strength', 0)
+                 delta_consistency = delta_analysis.get('consistency', 0)
+                 # Simple score based on magnitude for now; direction handled elsewhere
+                 delta_val = delta_strength * 0.7 + delta_consistency * 0.3
+            add_component('delta', delta_weight, delta_val, {'direction': delta_analysis.get('direction')})
+
+            # 2. Bid-Ask Imbalance
+            ba_weight = self.flow_weights.get('bid_ask_imbalance', 0)
+            ba_val = 0.0
+            if bid_ask.get('valid', False) and bid_ask.get('significant', False):
+                 ba_val = bid_ask.get('strength', 0)
+            add_component('bid_ask_imbalance', ba_weight, ba_val, {'direction': bid_ask.get('direction'), 'significant': bid_ask.get('significant')})
+
+            # 3. Absorption Analysis
+            abs_weight = self.flow_weights.get('absorption', 0)
+            abs_val = 0.0
+            if absorption.get('valid', False) and absorption.get('absorption_detected', False):
+                 abs_val = 1.0 # Score presence of absorption
+            add_component('absorption', abs_weight, abs_val, {'detected': absorption.get('absorption_detected'), 'direction': absorption.get('direction')})
+
+            # 4. Effort vs. Result Analysis
+            evr_weight = self.flow_weights.get('effort_vs_result', 0)
+            evr_val = 0.0
+            if effort_result.get('valid', False):
+                 anomaly = effort_result.get('anomaly_detected', False)
+                 if not anomaly: # Reward normal efficiency
+                      efficiency = effort_result.get('efficiency', 0)
+                      avg_efficiency = max(0.0001, effort_result.get('avg_efficiency', 0.0001))
+                      efficiency_ratio = min(2.0, efficiency / avg_efficiency) / 2.0 # Normalize 0-1
+                      evr_val = efficiency_ratio
+            add_component('effort_vs_result', evr_weight, evr_val, {'anomaly': effort_result.get('anomaly_detected')})
+
+            # 5. Liquidity Zones Interaction
+            liq_weight = self.flow_weights.get('liquidity', 0)
+            liq_val = 0.0
+            if liquidity and liquidity.get('valid', False):
+                 if liquidity.get('in_liquidity_zone', False): liq_val = 1.0
+                 elif liquidity.get('nearest_zone') and liquidity['nearest_zone'].get('distance_atr', float('inf')) < 1: liq_val = 0.5
+            add_component('liquidity', liq_weight, liq_val, {'in_zone': liquidity.get('in_liquidity_zone') if liquidity else False})
+
+            # 6. Institutional Activity
+            inst_weight = self.flow_weights.get('institutional_activity', 0) # Use updated key if changed
+            inst_val = 0.0
+            inst_details = {}
+            if institutional and institutional.get('valid', False):
+                 inst_details = {'direction': institutional.get('direction'), 'significant': institutional.get('significant_activity')}
+                 if institutional.get('significant_activity', False):
+                      inst_val = institutional.get('strength', 0)
+                      # Bonus for consistency? (Add separately or factor into weight?)
+                      # if institutional.get('consistent_pressure', False): inst_val = min(1.0, inst_val + 0.2) # Example boost
+            add_component('institutional', inst_weight, inst_val, inst_details)
+
+            # 7. Transaction Intensity
+            intens_weight = self.flow_weights.get('transaction_intensity', 0)
+            intens_val = 0.0
+            if intensity and intensity.get('valid', False) and intensity.get('high_intensity', False):
+                 intens_val = intensity.get('intensity', 0)
+            add_component('transaction_intensity', intens_weight, intens_val, {'momentum': intensity.get('momentum') if intensity else None})
+
+            # 8. VSA Signal Component
+            vsa_weight = self.flow_weights.get('vsa_signal', 0)
+            vsa_val = 0.0
+            vsa_details = {}
+            if vsa_analysis and vsa_analysis.get('signal') != 'none':
+                 vsa_details = {'signal': vsa_analysis.get('signal')}
+                 # Score based on confidence, maybe directionality?
+                 vsa_val = vsa_analysis.get('confidence', 0.0)
+            add_component('vsa_signal', vsa_weight, vsa_val, vsa_details)
+
+            # 9. Flow Divergence Component
+            div_weight = self.flow_weights.get('flow_divergence', 0)
+            div_val = 0.0 # Score represents 'normality', higher divergence could be negative
+            div_details = {}
+            if flow_divergence and flow_divergence.get('interpretation') != 'disabled':
+                 div_details = {'interpretation': flow_divergence.get('interpretation'), 'raw_score': flow_divergence.get('score')}
+                 # Example: Score 1.0 if normal, decreases towards 0 as divergence increases
+                 div_raw_score = flow_divergence.get('score', 0.0)
+                 div_threshold = self.flow_divergence_threshold
+                 div_val = max(0.0, 1.0 - min(1.0, div_raw_score / (div_threshold * 2.0))) # Score higher for normality
+            add_component('flow_divergence', div_weight, div_val, div_details)
+
+
+            # 10. Inventory Adjustment (Applied directly to score, not normalized component value)
+            inventory_weight = self.flow_weights.get('inventory', 0) # Note: weight should maybe be fixed, not configurable?
+            inventory_component = inventory_adjustment * inventory_weight
+            score += inventory_component # Apply adjustment after calculating weighted sum
+            component_scores['inventory'] = {'adjustment': inventory_adjustment, 'weighted_effect': inventory_component}
+
+
+            # Final Normalization
+            normalized_score = (score / positive_max_score) * 10 if positive_max_score > 0 else 0
+            normalized_score = min(10.0, max(0.0, normalized_score)) # Clamp 0-10
+
+            return {
+                'score': normalized_score,
+                'raw_weighted_score': score,
+                'max_possible_positive_score': positive_max_score * 10, # Max score from positive weights
+                'components': component_scores
+            }
+        except Exception as e:
+             self.logger.error(f"Error calculating flow score for {symbol} {timeframe}: {str(e)}")
+             return {'score': 0.0, 'error': f"Score calc error: {e}", 'components': {}}
+
+
+    def _update_market_impact_history(self, symbol: str, df: pd.DataFrame, real_time_data: Dict):
+         """ Helper to update recent volume and spread history for market impact calc. """
+         try:
+            impact_cache = self.market_impact[symbol]
+            if 'volume' in df.columns:
+                 impact_cache['recent_volume'].append(df['volume'].iloc[-1]) # Append latest volume
+            if 'bid' in real_time_data and 'ask' in real_time_data and real_time_data['bid'] > 0:
+                 spread = real_time_data['ask'] - real_time_data['bid']
+                 price = (real_time_data['ask'] + real_time_data['bid']) / 2
+                 relative_spread = spread / price
+                 impact_cache['spread_history'].append(relative_spread)
+            # Update volatility factor (maybe use GARCH forecast?)
+            # garch_vol = self._get_garch_volatility(...) # Needs context
+            # if garch_vol: impact_cache['volatility_factor'] = 1.0 + (garch_vol / 20.0 - 1.0) # Example scaling
+         except Exception as e:
+              self.logger.error(f"Error updating market impact history: {e}")
+
+
+    # --- Ensure ALL other methods from Orderflow 2903.txt are included below ---
+    # (e.g., _update_inventory_model, _calculate_inventory_adjustment, _update_bayesian_parameters,
+    #  _calculate_market_impact, analyze_delta, analyze_bid_ask_dynamics, analyze_volume_profile,
+    #  detect_liquidity_zones, _merge_overlapping_ranges, check_absorption,
+    #  analyze_effort_vs_result, detect_institutional_activity, calculate_transaction_intensity,
+    #  estimate_slippage, _determine_flow_direction)
+    #  Use the original implementations fromunless specific updates were discussed.
+
+    # --- [Paste the implementations for the above methods here from] ---
+    # --- [ Make sure calculate_flow_score is replaced with the updated version above ] ---
+    # --- [ Make sure _update_dynamic_thresholds is replaced with the updated version above ] ---
+
+
+# --- Testing Block ---
+# if __name__ == '__main__':
+#    # Add test setup here...
+#    pass
